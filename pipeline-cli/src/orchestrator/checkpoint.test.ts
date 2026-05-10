@@ -27,10 +27,17 @@ import {
   emitCheckpointCommit,
   worktreePath,
 } from './checkpoint.js';
+import { makeGitEnv } from '../__test-helpers/git-env.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+//
+// AISDLC-253: every `execSync('git ...')` MUST use `env: makeGitEnv()` so the
+// fixture's git ops can never bleed into the host worktree via a polluted
+// GIT_DIR / GIT_WORK_TREE inherited from the parent shell. See the helper
+// module for the full rationale.
 
 const tmpDirs: string[] = [];
+const GIT_ENV: NodeJS.ProcessEnv = makeGitEnv();
 
 function makeTmpDir(): string {
   const d = mkdtempSync(join(tmpdir(), 'checkpoint-test-'));
@@ -41,13 +48,19 @@ function makeTmpDir(): string {
 /** Create a minimal git repo with one initial commit. Returns the repo path. */
 function makeGitRepo(): string {
   const d = makeTmpDir();
-  execSync('git init', { cwd: d, stdio: 'pipe' });
-  execSync('git config user.email "test@example.com"', { cwd: d, stdio: 'pipe' });
-  execSync('git config user.name "Test User"', { cwd: d, stdio: 'pipe' });
+  execSync('git init', { cwd: d, env: GIT_ENV, stdio: 'pipe' });
+  // Write per-repo identity to .git/config. Production emitCheckpointCommit
+  // doesn't pass env (it inherits the operator's git env), so the test repo
+  // needs identity in its config for emitCheckpointCommit's commits to
+  // succeed. With env: GIT_ENV above, GIT_DIR is NOT inherited, so this
+  // config write lands in d/.git/config (not the host worktree's config).
+  execSync('git config user.email "test@test.invalid"', { cwd: d, env: GIT_ENV, stdio: 'pipe' });
+  execSync('git config user.name "Test"', { cwd: d, env: GIT_ENV, stdio: 'pipe' });
   writeFileSync(join(d, 'README.md'), '# test\n', 'utf8');
-  execSync('git add README.md', { cwd: d, stdio: 'pipe' });
+  execSync('git add README.md', { cwd: d, env: GIT_ENV, stdio: 'pipe' });
   execSync('git -c commit.gpgsign=false commit --no-verify -m "chore: initial"', {
     cwd: d,
+    env: GIT_ENV,
     stdio: 'pipe',
   });
   return d;
@@ -63,22 +76,29 @@ function makeGitRepoWithOrigin(): { repoDir: string; originDir: string } {
 
   const originDir = join(baseDir, 'origin.git');
   mkdirSync(originDir);
-  execSync('git init --bare', { cwd: originDir, stdio: 'pipe' });
+  execSync('git init --bare', { cwd: originDir, env: GIT_ENV, stdio: 'pipe' });
 
   const repoDir = join(baseDir, 'repo');
   mkdirSync(repoDir);
-  execSync('git init', { cwd: repoDir, stdio: 'pipe' });
-  execSync(`git remote add origin ${originDir}`, { cwd: repoDir, stdio: 'pipe' });
-  execSync('git config user.email "test@example.com"', { cwd: repoDir, stdio: 'pipe' });
-  execSync('git config user.name "Test User"', { cwd: repoDir, stdio: 'pipe' });
-  writeFileSync(join(repoDir, 'README.md'), '# test\n', 'utf8');
-  execSync('git add README.md', { cwd: repoDir, stdio: 'pipe' });
-  execSync('git -c commit.gpgsign=false commit --no-verify -m "chore: initial"', {
+  execSync('git init', { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
+  execSync(`git remote add origin ${originDir}`, { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
+  // Per-repo identity for emitCheckpointCommit (which doesn't pass env). Safe
+  // because env: GIT_ENV blocks GIT_DIR pollution; this lands in repoDir/.git/config.
+  execSync('git config user.email "test@test.invalid"', {
     cwd: repoDir,
+    env: GIT_ENV,
     stdio: 'pipe',
   });
-  execSync('git push origin HEAD:main', { cwd: repoDir, stdio: 'pipe' });
-  execSync('git fetch origin', { cwd: repoDir, stdio: 'pipe' });
+  execSync('git config user.name "Test"', { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
+  writeFileSync(join(repoDir, 'README.md'), '# test\n', 'utf8');
+  execSync('git add README.md', { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
+  execSync('git -c commit.gpgsign=false commit --no-verify -m "chore: initial"', {
+    cwd: repoDir,
+    env: GIT_ENV,
+    stdio: 'pipe',
+  });
+  execSync('git push origin HEAD:main', { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
+  execSync('git fetch origin', { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
 
   return { repoDir, originDir };
 }
@@ -187,6 +207,7 @@ describe('emitCheckpointCommit() — real git repo', () => {
 
     const log = execSync('git log -1 --format=%s', {
       cwd: repoDir,
+      env: GIT_ENV,
       encoding: 'utf8',
     }).trim();
     expect(log).toBe('wip(checkpoint): after editing 3 files (AISDLC-242)');
@@ -219,6 +240,7 @@ describe('emitCheckpointCommit() — real git repo', () => {
     // Verify the annotation was stored verbatim (no shell evaluation occurred)
     const log = execSync('git log -1 --format=%s', {
       cwd: repoDir,
+      env: GIT_ENV,
       encoding: 'utf8',
     }).trim();
     expect(log).toContain('$(echo pwned)');
@@ -281,7 +303,7 @@ describe('countCheckpointCommits()', () => {
     writeFileSync(join(repoDir, 'chk1.ts'), 'export const c1 = 1;\n', 'utf8');
     execSync(
       `git add chk1.ts && git -c commit.gpgsign=false commit --no-verify -m "wip(checkpoint): first (AISDLC-242)"`,
-      { cwd: repoDir, stdio: 'pipe', shell: '/bin/sh' },
+      { cwd: repoDir, env: GIT_ENV, stdio: 'pipe', shell: '/bin/sh' },
     );
 
     expect(countCheckpointCommits(repoDir)).toBe(1);
@@ -293,12 +315,12 @@ describe('countCheckpointCommits()', () => {
     writeFileSync(join(repoDir, 'c1.ts'), 'export const c1 = 1;\n', 'utf8');
     execSync(
       `git add c1.ts && git -c commit.gpgsign=false commit --no-verify -m "wip(checkpoint): A (AISDLC-242)"`,
-      { cwd: repoDir, stdio: 'pipe', shell: '/bin/sh' },
+      { cwd: repoDir, env: GIT_ENV, stdio: 'pipe', shell: '/bin/sh' },
     );
     writeFileSync(join(repoDir, 'c2.ts'), 'export const c2 = 2;\n', 'utf8');
     execSync(
       `git add c2.ts && git -c commit.gpgsign=false commit --no-verify -m "wip(checkpoint): B (AISDLC-242)"`,
-      { cwd: repoDir, stdio: 'pipe', shell: '/bin/sh' },
+      { cwd: repoDir, env: GIT_ENV, stdio: 'pipe', shell: '/bin/sh' },
     );
 
     expect(countCheckpointCommits(repoDir)).toBe(2);
@@ -310,7 +332,7 @@ describe('countCheckpointCommits()', () => {
     writeFileSync(join(repoDir, 'feat.ts'), 'export const f = 1;\n', 'utf8');
     execSync(
       `git add feat.ts && git -c commit.gpgsign=false commit --no-verify -m "feat: add something"`,
-      { cwd: repoDir, stdio: 'pipe', shell: '/bin/sh' },
+      { cwd: repoDir, env: GIT_ENV, stdio: 'pipe', shell: '/bin/sh' },
     );
 
     // A regular commit should not be counted as checkpoint
@@ -340,7 +362,7 @@ describe('countCommitsBeyondMain()', () => {
     writeFileSync(join(repoDir, 'new.ts'), 'export const n = 1;\n', 'utf8');
     execSync(
       `git add new.ts && git -c commit.gpgsign=false commit --no-verify -m "feat: add new"`,
-      { cwd: repoDir, stdio: 'pipe', shell: '/bin/sh' },
+      { cwd: repoDir, env: GIT_ENV, stdio: 'pipe', shell: '/bin/sh' },
     );
     expect(countCommitsBeyondMain(repoDir)).toBe(1);
   });
@@ -352,7 +374,7 @@ describe('countCommitsBeyondMain()', () => {
       writeFileSync(join(repoDir, `file${i}.ts`), `export const f${i} = ${i};\n`, 'utf8');
       execSync(
         `git add file${i}.ts && git -c commit.gpgsign=false commit --no-verify -m "feat: commit ${i}"`,
-        { cwd: repoDir, stdio: 'pipe', shell: '/bin/sh' },
+        { cwd: repoDir, env: GIT_ENV, stdio: 'pipe', shell: '/bin/sh' },
       );
     }
 
@@ -433,22 +455,22 @@ describe('detectRecoverableWorktree() — recoverable detection with real git', 
     // Create a branch and worktree
     execSync(`git checkout -b ai-sdlc/${taskId.toLowerCase()}-test`, {
       cwd: repoDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
-    execSync('git checkout main', { cwd: repoDir, stdio: 'pipe' });
+    execSync('git checkout main', { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
     execSync(`git worktree add ${wtDir} ai-sdlc/${taskId.toLowerCase()}-test`, {
       cwd: repoDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
 
     // Add a checkpoint commit in the worktree
-    execSync('git config user.email "test@example.com"', { cwd: wtDir, stdio: 'pipe' });
-    execSync('git config user.name "Test"', { cwd: wtDir, stdio: 'pipe' });
     writeFileSync(join(wtDir, 'partial.ts'), 'const x = 1;\n', 'utf8');
-    execSync('git add partial.ts', { cwd: wtDir, stdio: 'pipe' });
+    execSync('git add partial.ts', { cwd: wtDir, env: GIT_ENV, stdio: 'pipe' });
     execSync(
       `git -c commit.gpgsign=false commit --no-verify -m "wip(checkpoint): partial (${taskId})"`,
-      { cwd: wtDir, stdio: 'pipe' },
+      { cwd: wtDir, env: GIT_ENV, stdio: 'pipe' },
     );
 
     // Write sentinel
@@ -471,20 +493,21 @@ describe('detectRecoverableWorktree() — recoverable detection with real git', 
 
     execSync(`git checkout -b ai-sdlc/${taskId.toLowerCase()}-ci-test`, {
       cwd: repoDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
-    execSync('git checkout main', { cwd: repoDir, stdio: 'pipe' });
+    execSync('git checkout main', { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
     execSync(`git worktree add ${wtDir} ai-sdlc/${taskId.toLowerCase()}-ci-test`, {
       cwd: repoDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
 
-    execSync('git config user.email "test@example.com"', { cwd: wtDir, stdio: 'pipe' });
-    execSync('git config user.name "Test"', { cwd: wtDir, stdio: 'pipe' });
     writeFileSync(join(wtDir, 'ci.ts'), 'const ci = 1;\n', 'utf8');
-    execSync('git add ci.ts', { cwd: wtDir, stdio: 'pipe' });
+    execSync('git add ci.ts', { cwd: wtDir, env: GIT_ENV, stdio: 'pipe' });
     execSync(`git -c commit.gpgsign=false commit --no-verify -m "feat: ci test (${taskId})"`, {
       cwd: wtDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
 
@@ -508,20 +531,21 @@ describe('detectRecoverableWorktree() — recoverable detection with real git', 
 
     execSync(`git checkout -b ai-sdlc/${taskId.toLowerCase()}-no-chk`, {
       cwd: repoDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
-    execSync('git checkout main', { cwd: repoDir, stdio: 'pipe' });
+    execSync('git checkout main', { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
     execSync(`git worktree add ${wtDir} ai-sdlc/${taskId.toLowerCase()}-no-chk`, {
       cwd: repoDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
 
-    execSync('git config user.email "test@example.com"', { cwd: wtDir, stdio: 'pipe' });
-    execSync('git config user.name "Test"', { cwd: wtDir, stdio: 'pipe' });
     writeFileSync(join(wtDir, 'work.ts'), 'const w = 1;\n', 'utf8');
-    execSync('git add work.ts', { cwd: wtDir, stdio: 'pipe' });
+    execSync('git add work.ts', { cwd: wtDir, env: GIT_ENV, stdio: 'pipe' });
     execSync(`git -c commit.gpgsign=false commit --no-verify -m "feat: real work (${taskId})"`, {
       cwd: wtDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
 
@@ -542,23 +566,22 @@ describe('detectRecoverableWorktree() — recoverable detection with real git', 
 
     execSync(`git checkout -b ai-sdlc/${taskId.toLowerCase()}-multi-chk`, {
       cwd: repoDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
-    execSync('git checkout main', { cwd: repoDir, stdio: 'pipe' });
+    execSync('git checkout main', { cwd: repoDir, env: GIT_ENV, stdio: 'pipe' });
     execSync(`git worktree add ${wtDir} ai-sdlc/${taskId.toLowerCase()}-multi-chk`, {
       cwd: repoDir,
+      env: GIT_ENV,
       stdio: 'pipe',
     });
-
-    execSync('git config user.email "test@example.com"', { cwd: wtDir, stdio: 'pipe' });
-    execSync('git config user.name "Test"', { cwd: wtDir, stdio: 'pipe' });
 
     for (let i = 1; i <= 3; i++) {
       writeFileSync(join(wtDir, `wip${i}.ts`), `const w${i} = ${i};\n`, 'utf8');
-      execSync('git add .', { cwd: wtDir, stdio: 'pipe' });
+      execSync('git add .', { cwd: wtDir, env: GIT_ENV, stdio: 'pipe' });
       execSync(
         `git -c commit.gpgsign=false commit --no-verify -m "wip(checkpoint): edit ${i} (${taskId})"`,
-        { cwd: wtDir, stdio: 'pipe' },
+        { cwd: wtDir, env: GIT_ENV, stdio: 'pipe' },
       );
     }
 
