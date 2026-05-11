@@ -12,22 +12,17 @@ import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { pushBranchWithRebase } from './execute.js';
+import { makeGitEnv } from './__test-helpers/git-env.js';
 
 const execFileAsync = promisify(execFile);
 
-// Strip GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE so test git commands run
-// inside tmpDir bind to tmpDir's own .git rather than a parent worktree's
-// (husky pre-push exports these). See AISDLC-72.
-function cleanGitEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  delete env.GIT_DIR;
-  delete env.GIT_WORK_TREE;
-  delete env.GIT_INDEX_FILE;
-  return env;
-}
+// makeGitEnv() (AISDLC-257) constructs a minimal env that deliberately omits
+// GIT_DIR + GIT_WORK_TREE so test git commands always bind to the temp repo's
+// own .git, not a parent worktree's context. Identity is provided via
+// GIT_AUTHOR_* / GIT_COMMITTER_* so we don't need `git config user.email` writes.
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync('git', args, { cwd, env: cleanGitEnv() });
+  const { stdout } = await execFileAsync('git', args, { cwd, env: makeGitEnv() });
   return stdout.trim();
 }
 
@@ -45,12 +40,16 @@ async function setup(): Promise<Setup> {
   const feature = 'feat/test';
 
   // Bare origin
-  await execFileAsync('git', ['init', '-q', '--bare', origin], { env: cleanGitEnv() });
+  await execFileAsync('git', ['init', '-q', '--bare', origin], { env: makeGitEnv() });
 
   // Seed clone with main + feature branch
-  await execFileAsync('git', ['clone', '-q', origin, seed], { env: cleanGitEnv() });
-  await git(seed, 'config', 'user.email', 't@t.com');
-  await git(seed, 'config', 'user.name', 't');
+  await execFileAsync('git', ['clone', '-q', origin, seed], { env: makeGitEnv() });
+  // Per-repo identity in .git/config so production code's `git rebase`
+  // (which inherits process.env without GIT_AUTHOR_*) can find an identity.
+  // Safe alongside env: makeGitEnv() — GIT_DIR is not polluted, so this
+  // write lands in seed/.git/config (not the host worktree's config).
+  await git(seed, 'config', 'user.email', 'test@test.invalid');
+  await git(seed, 'config', 'user.name', 'Test');
   await writeFile(join(seed, 'README.md'), 'init\n');
   await git(seed, 'add', 'README.md');
   await git(seed, 'commit', '-q', '-m', 'init');
@@ -66,10 +65,10 @@ async function setup(): Promise<Setup> {
   await git(seed, 'commit', '-q', '-m', 'feat-init');
   await git(seed, 'push', '-q', '-u', 'origin', feature);
 
-  // Work clone (simulates pipeline's worktree)
-  await execFileAsync('git', ['clone', '-q', origin, workClone], { env: cleanGitEnv() });
-  await git(workClone, 'config', 'user.email', 't@t.com');
-  await git(workClone, 'config', 'user.name', 't');
+  // Work clone (simulates pipeline's worktree). Same per-repo identity as seed.
+  await execFileAsync('git', ['clone', '-q', origin, workClone], { env: makeGitEnv() });
+  await git(workClone, 'config', 'user.email', 'test@test.invalid');
+  await git(workClone, 'config', 'user.name', 'Test');
   await git(workClone, 'fetch', 'origin', feature);
   await git(workClone, 'checkout', '-q', feature);
 
@@ -89,10 +88,11 @@ async function setupNoDrift(): Promise<Setup> {
   const workClone = join(root, 'work');
   const feature = 'feat/test';
 
-  await execFileAsync('git', ['init', '-q', '--bare', origin], { env: cleanGitEnv() });
-  await execFileAsync('git', ['clone', '-q', origin, workClone], { env: cleanGitEnv() });
-  await git(workClone, 'config', 'user.email', 't@t.com');
-  await git(workClone, 'config', 'user.name', 't');
+  await execFileAsync('git', ['init', '-q', '--bare', origin], { env: makeGitEnv() });
+  await execFileAsync('git', ['clone', '-q', origin, workClone], { env: makeGitEnv() });
+  // Per-repo identity for production-code rebase + commit (see setup() comment).
+  await git(workClone, 'config', 'user.email', 'test@test.invalid');
+  await git(workClone, 'config', 'user.name', 'Test');
   await writeFile(join(workClone, 'README.md'), 'init\n');
   await git(workClone, 'add', 'README.md');
   await git(workClone, 'commit', '-q', '-m', 'init');
@@ -184,9 +184,7 @@ describe('pushBranchWithRebase', () => {
     const tmp = await mkdtemp(join(tmpdir(), 'push-bad-'));
     const wc = join(tmp, 'work');
     try {
-      await execFileAsync('git', ['init', '-q', wc], { env: cleanGitEnv() });
-      await git(wc, 'config', 'user.email', 't@t.com');
-      await git(wc, 'config', 'user.name', 't');
+      await execFileAsync('git', ['init', '-q', wc], { env: makeGitEnv() });
       await writeFile(join(wc, 'a.md'), 'a\n');
       await git(wc, 'add', 'a.md');
       await git(wc, 'commit', '-q', '-m', 'init');
