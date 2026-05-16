@@ -13,10 +13,11 @@ requiresDocs: []
 
 # RFC-0025: Framework Quality Monitoring (Non-Decision Failure Modes)
 
-**Status:** Draft (initial seed; structure may shift)
-**Lifecycle:** Draft
+**Status:** Ready for Review — operator OQ walkthrough complete 2026-05-15; all 10 §13 OQs resolved (confidence-bucketed classifier with per-org thresholds, YAML+CLI-flag severity weight override, multi-window 7d/30d/90d recurrence, per-org-configurable suggest-only attribution, operator-initiated pre-filled GitHub issue for upstream reporting, capture-record-based coverage-gap response, composite blast-radius determinism sampling, first-capture MTTR with MTTD as v2, instrumented operator-time-cost via events.jsonl, strict vendor-namespace enforcement). §13.1 codifies the consolidated `.ai-sdlc/quality-monitoring.yaml` per-org config schema. **AISDLC-270 / PR #481 closed 2026-05-16** after audit found the subagent forged operator sign-off + 8/10 OQs diverged from operator-affirmed resolutions; **RFC-0025 Refit chain (AISDLC-302..307)** replaces it.
+**Lifecycle:** Ready for Review
 **Author:** dominique@reliablegenius.io
 **Created:** 2026-05-03
+**Updated:** 2026-05-15
 **Target Spec Version:** v1alpha1
 **Depends on:** RFC-0015 (autonomous orchestrator), RFC-0024 (emergent issue capture)
 **Anchor:** [VISION.md §4](../../VISION.md) — framework's quality contract
@@ -272,7 +273,7 @@ The following normative answers were established by operator walkthrough on **20
 
 **OQ-1 — Default classification when ambiguous:** When the classifier can't decide between `operator-under-decided` and `framework-misbehaved`, default to `ambiguous` (operator triages) or default to `operator-under-decided` (less alarming) or default to `framework-misbehaved` (more alarming, more honest)? Recommendation: `ambiguous` — preserves operator agency while honest about uncertainty.
 
-   **Resolution (2026-05-15):** **Confidence-bucketed classification** with three tiers. High-confidence (≥ 0.7): auto-classify into `operator-under-decided` or `framework-misbehaved`. Mid-confidence (0.3–0.7): `ambiguous` (operator triages). Low-confidence (< 0.3): unclassified, log only. Per-org thresholds configurable in `quality-monitoring.yaml`. Composes with the shared classifier substrate (RFC-0024 Refit Phase 2 / AISDLC-274) and RFC-0035 Phase 5 / AISDLC-289. **Selected over `ambiguous`-only** because tiered is the industry pattern (Datadog/Sentry); composes architecturally with the shared classifier substrate; lets operators tune the noise floor per-org.
+   **Resolution (2026-05-15):** **Confidence-bucketed classification** with three tiers. High-confidence (≥ 0.7): auto-classify into `operator-under-decided` or `framework-misbehaved`. Mid-confidence (0.3–0.7): `ambiguous` (operator triages). Low-confidence (< 0.3): unclassified, log only. Per-org thresholds configurable in `quality-monitoring.yaml`. Composes with the shared classifier substrate (RFC-0024 Refit Phase 2 / AISDLC-321) and RFC-0035 Phase 5 / AISDLC-289. **Selected over `ambiguous`-only** because tiered is the industry pattern (Datadog/Sentry); composes architecturally with the shared classifier substrate; lets operators tune the noise floor per-org.
 
 **OQ-2 — Severity weight tuning surface:** Operators can override severity weights per §10. Should this be a YAML resource (`.ai-sdlc/quality-monitoring.yaml`) or CLI flags? Recommendation: YAML resource — discoverable, version-controlled, validatable.
 
