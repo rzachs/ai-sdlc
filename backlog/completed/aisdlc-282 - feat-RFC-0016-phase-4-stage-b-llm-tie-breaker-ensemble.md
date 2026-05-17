@@ -1,7 +1,7 @@
 ---
 id: AISDLC-282
 title: 'feat: RFC-0016 Phase 4 — Stage B LLM tie-breaker + Q5 ensemble'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-05-15'
 labels:
