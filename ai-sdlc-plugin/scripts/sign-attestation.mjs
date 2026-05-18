@@ -193,10 +193,52 @@ async function main() {
     fail(err.message ?? String(err));
   }
   const policy = readFileSync(join(repoRoot, '.ai-sdlc', 'review-policy.md'), 'utf-8');
-  const verdicts = JSON.parse(readFileSync(verdictsPath, 'utf-8'));
-  if (!Array.isArray(verdicts)) {
-    fail(`${verdictsPath} must contain a JSON array of reviewer verdicts`);
+  const verdictsRaw = JSON.parse(readFileSync(verdictsPath, 'utf-8'));
+  // AISDLC-355 — support both shapes during transition:
+  //   Flat array:       [{agentId, harness, approved, findings}, ...]
+  //     (written by resume-from-draft after the Bug 2 fix)
+  //   Nested object:    {taskId, decision, counts, verdicts: [...]}
+  //     (written by writeVerdictFile in execute.ts / VerdictFilePayload shape)
+  //   Docs-only shape:  [{agentId, harness, approved, findings, summary}, ...]
+  //     (synthesized by check-attestation-sign.sh for docs-only PRs, AISDLC-215)
+  // Extract the flat array from whichever shape was written.
+  let verdicts;
+  if (Array.isArray(verdictsRaw)) {
+    verdicts = verdictsRaw;
+  } else if (
+    verdictsRaw !== null &&
+    typeof verdictsRaw === 'object' &&
+    Array.isArray(verdictsRaw.verdicts)
+  ) {
+    verdicts = verdictsRaw.verdicts;
+  } else {
+    fail(
+      `${verdictsPath} must contain either a JSON array of reviewer verdicts or an object with a 'verdicts' array key`,
+    );
   }
+  // AISDLC-355 CRITICAL: handle both the new flat-array `findings` form and
+  // the legacy counts-object form so sign-attestation never silently reports
+  // 0 findings when the verdict file uses the flat-array shape.
+  function countBySeverity(findings) {
+    if (Array.isArray(findings)) {
+      // New flat-array form: count by severity field.
+      const counts = { critical: 0, major: 0, minor: 0, suggestion: 0 };
+      for (const f of findings) {
+        if (f && typeof f === 'object' && f.severity in counts) {
+          counts[f.severity]++;
+        }
+      }
+      return counts;
+    }
+    // Legacy counts-object form (or missing/null): read directly with ?? 0.
+    return {
+      critical: findings?.critical ?? 0,
+      major: findings?.major ?? 0,
+      minor: findings?.minor ?? 0,
+      suggestion: findings?.suggestion ?? 0,
+    };
+  }
+
   const reviewers = verdicts.map((v) => {
     if (!v?.agentId) fail(`reviewer verdict missing agentId: ${JSON.stringify(v)}`);
     const agentFile = join(repoRoot, 'ai-sdlc-plugin', 'agents', `${v.agentId}.md`);
@@ -206,12 +248,7 @@ async function main() {
       agentFileContent: readFileSync(agentFile, 'utf-8'),
       harness: v.harness ?? 'unknown',
       approved: Boolean(v.approved),
-      findings: {
-        critical: v.findings?.critical ?? 0,
-        major: v.findings?.major ?? 0,
-        minor: v.findings?.minor ?? 0,
-        suggestion: v.findings?.suggestion ?? 0,
-      },
+      findings: countBySeverity(v.findings),
     };
   });
   const pluginManifest = JSON.parse(
