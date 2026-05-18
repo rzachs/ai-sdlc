@@ -119,10 +119,9 @@ describe('chaos — mid-dispatch SIGTERM (Q2 resume)', () => {
         throw new Error('simulated SIGTERM mid-dispatch');
       },
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       artifactsDir: workdir,
       runId: 'run-chaos-mid-dispatch',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
 
     const result = await runOrchestratorTick(config, adapters, 1);
@@ -175,10 +174,9 @@ describe('chaos — mid-dispatch SIGTERM (Q2 resume)', () => {
       frontier: fakeFrontier(['AISDLC-CHAOS']),
       dispatch: dispatchFn,
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       artifactsDir: workdir,
       runId: 'run-chaos-resume',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
 
     // Tick 1 — crashes.
@@ -216,10 +214,9 @@ describe('chaos — mid-finalize SIGTERM (events sink throws)', () => {
       frontier: fakeFrontier(['AISDLC-FIN']),
       dispatch: async (taskId) => approvedResult(taskId, `https://github.com/x/y/pull/9`),
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       artifactsDir: workdir,
       runId: 'run-chaos-mid-finalize',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
       emitEvent: (ev) => {
         sinkCalls += 1;
         captured.push(ev);
@@ -354,10 +351,9 @@ describe('chaos — events.jsonl append-only integrity', () => {
         return approvedResult(taskId, 'https://github.com/x/y/pull/1');
       },
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       artifactsDir: workdir,
       runId: 'run-chaos-integ',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
 
     await runOrchestratorTick(config, adapters, 1);
@@ -416,10 +412,9 @@ describe('chaos — SIGTERM drain (Q2 resume contract)', () => {
       frontier: fakeFrontier(['AISDLC-DRAIN-A']),
       dispatch: async (taskId) => approvedResult(taskId, 'https://github.com/x/y/pull/A'),
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       artifactsDir: workdir,
       runId: 'run-A',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
     await runOrchestratorTick(config, adaptersA, 1);
 
@@ -431,10 +426,9 @@ describe('chaos — SIGTERM drain (Q2 resume contract)', () => {
       frontier: fakeFrontier(['AISDLC-DRAIN-B']),
       dispatch: async (taskId) => approvedResult(taskId, 'https://github.com/x/y/pull/B'),
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       artifactsDir: workdir,
       runId: 'run-B',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
     await runOrchestratorTick(config, adaptersB, 1);
 

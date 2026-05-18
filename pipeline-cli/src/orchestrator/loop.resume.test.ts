@@ -184,14 +184,13 @@ describe('runOrchestratorTick — aborted outcome (AISDLC-242)', () => {
       frontier: fakeFrontier([taskId]),
       dispatch: flipAndReturn(workDir, taskId, 'aborted', 'watchdog fired after 30min'),
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       emitEvent: sink,
       runner,
       runId: 'aisdlc-242-aborted-test',
       graphLoader: () => ({ nodes: new Map(), openIds: [], completedIds: [] }),
       taskLabelsLoader: () => [],
       calibrationLogPath: '/nonexistent-bypass.jsonl',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
 
     await runOrchestratorTick(config, adapters, 1);
@@ -216,14 +215,13 @@ describe('runOrchestratorTick — aborted outcome (AISDLC-242)', () => {
       frontier: fakeFrontier([taskId]),
       dispatch: flipAndReturn(workDir, taskId, 'aborted', 'watchdog fired after 30min'),
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       emitEvent: sink,
       runner,
       runId: 'aisdlc-242-recoverable-event',
       graphLoader: () => ({ nodes: new Map(), openIds: [], completedIds: [] }),
       taskLabelsLoader: () => [],
       calibrationLogPath: '/nonexistent-bypass.jsonl',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
 
     await runOrchestratorTick(config, adapters, 1);
@@ -258,14 +256,13 @@ describe('runOrchestratorTick — aborted outcome (AISDLC-242)', () => {
       frontier: fakeFrontier([taskId]),
       dispatch: flipAndReturn(workDir, taskId, 'developer-failed', 'commitSha=null'),
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       emitEvent: sink,
       runner,
       runId: 'aisdlc-242-dev-failed',
       graphLoader: () => ({ nodes: new Map(), openIds: [], completedIds: [] }),
       taskLabelsLoader: () => [],
       calibrationLogPath: '/nonexistent-bypass.jsonl',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
 
     await runOrchestratorTick(config, adapters, 1);
@@ -406,13 +403,12 @@ describe('runOrchestratorTick — resume path (AISDLC-242 AC #7)', () => {
         notes: 'killed again',
       }),
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       emitEvent: sink,
       runId: 'aisdlc-242-resume-tick2',
       graphLoader: () => ({ nodes: new Map(), openIds: [], completedIds: [] }),
       taskLabelsLoader: () => [],
       calibrationLogPath: '/nonexistent-bypass.jsonl',
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
 
     await runOrchestratorTick(config, adapters, 2);
@@ -530,6 +526,7 @@ describe('runOrchestratorTick — in-flight bypass for recoverable worktrees (AI
         notes: 'killed again',
       }),
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       emitEvent: sink,
       runId: 'aisdlc-242-inflight-bypass',
       graphLoader: () => ({ nodes: new Map(), openIds: [], completedIds: [] }),
@@ -538,8 +535,6 @@ describe('runOrchestratorTick — in-flight bypass for recoverable worktrees (AI
       // Inject the pre-populated in-flight map to simulate a cold-start
       // reconstruction that erroneously blocks a recoverable worktree.
       inFlight: preloadedInFlight,
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
 
     await runOrchestratorTick(config, adapters, 1);
@@ -591,14 +586,13 @@ describe('runOrchestratorTick — in-flight bypass for recoverable worktrees (AI
         notes: 'should not reach dispatch — blocked by live in-flight',
       }),
       escalate: async () => {},
+      parentBranchGuard: async () => {},
       emitEvent: sink,
       runId: 'aisdlc-242-live-dispatch-block',
       graphLoader: () => ({ nodes: new Map(), openIds: [], completedIds: [] }),
       taskLabelsLoader: () => [],
       calibrationLogPath: '/nonexistent-bypass.jsonl',
       inFlight: preloadedInFlight,
-      // AISDLC-363 — skip the parent-branch guard in tests (no real git state).
-      parentBranchGuard: async () => {},
     };
 
     await runOrchestratorTick(config, adapters, 1);
