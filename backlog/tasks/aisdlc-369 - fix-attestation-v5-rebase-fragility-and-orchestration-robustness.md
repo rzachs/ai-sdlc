@@ -23,7 +23,7 @@ references:
 
 Operator session 2026-05-19: shipping 11 PRs required ~30 re-sign cycles because the v5 attestation envelope DOES NOT survive sibling-PR merges in practice. Each time `origin/main` advances:
 
-1. CI's `verify-attestation` computes v5 hash → returns null (signedMergeBase not reachable, OR diff includes sibling-merged files)
+1. CI's `verify-attestation` computes v5 hash → returns null (signedMergeBase not reachable, OR diff includes additional files from the sibling merge)
 2. Falls through to v4 → v4 mismatch (base moved)
 3. Posts `ai-sdlc/attestation: failure - contentHashV4 mismatch`
 4. PR becomes BLOCKED → queue drops it → auto-merge flag cleared
@@ -31,7 +31,7 @@ Operator session 2026-05-19: shipping 11 PRs required ~30 re-sign cycles because
 
 For 8 PRs through the queue serially, that's **~32 manual re-sign cycles** at ~3min each = **96 min of pure re-sign overhead**, on top of CI cycle time.
 
-V5 was designed to fix this by binding to a frozen `signedMergeBase`, but the design assumed the verifier could reproduce the diff between `<signedMergeBase>..HEAD` identically locally vs. CI. In practice this is breaking.
+V5 was designed to fix this by binding to a frozen `signedMergeBase`, but the design assumed the verifier could reproduce the diff between `<signedMergeBase>..HEAD` identically locally vs. CI. In practice this is breaking on every queue rebase.
 
 Plus several queue/orchestration robustness issues compounded the pain.
 
@@ -45,19 +45,19 @@ Plus several queue/orchestration robustness issues compounded the pain.
 - **At verify time**: read `signedMergeBase` from envelope → diff `<signedMergeBase>..<HEAD>` → hash those files
 - Result MUST match envelope's `contentHashV5` regardless of where `origin/main` has moved
 
-In practice CI keeps reporting `contentHashV4 mismatch` after sibling merges, meaning **v5 returned null** (fell through to v4). Hypothesis: CI's shallow clone doesn't have `signedMergeBase` reachable, OR the diff produces a different file set on rebased PR HEAD than at sign time.
+In practice CI reports `contentHashV4 mismatch` whenever the queue rebases the PR's branch onto a new `main` tip, meaning **v5 returned null** (fell through to v4). Hypothesis: CI's shallow clone doesn't have `signedMergeBase` reachable, OR the diff produces a different file set on rebased PR HEAD than at sign time.
 
 Tasks:
 
-1. Add a `cli-verify-attestation-debug` command that prints v5 vs v4 vs v3 evaluation trace for a given PR + HEAD. Run against the last 5 stuck PRs (#543, #544, #546, #548, #549, #550) to identify which step fails.
+1. Add a `cli-verify-attestation-debug` command that prints v5 vs v4 vs v3 evaluation trace for a given PR + HEAD. Run against any open PR with `ai-sdlc/attestation: failure` to identify which step falls through.
 2. If `signedMergeBase` unreachable in CI: workflow needs `fetch-depth: 0` or explicit `git fetch <signedMergeBase>` step in `verify-attestation.yml`.
-3. If diff produces different files: the algorithm needs to canonicalize file set (sort + dedup) consistently OR exclude sibling-merged-but-not-by-us files via merge-base detection.
+3. If diff produces different files: the algorithm needs to canonicalize file set (sort + dedup) consistently OR scope the diff to only files the PR author touched via three-way merge-base detection.
 
 ### B. Auto-rearm on merge_group dequeue
 
 `auto-enable-auto-merge.yml` only fires on `pull_request opened` event. When the queue dequeues a PR (UNMERGEABLE), the auto-merge flag is cleared and operator must manually re-arm.
 
-Add a separate workflow `.github/workflows/auto-rearm-on-dequeue.yml`:
+Add a new auto-rearm workflow (target path under `.github/workflows/`):
 
 ```yaml
 on:
@@ -72,7 +72,7 @@ Job logic: for each open PR with `mergeable_state == 'clean'` and `auto_merge ==
 
 ### C. Pre-push helper: squash stacked chore-sign commits
 
-Re-sign cycles produce stacked `chore: sign v5 attestation` commits because the operator forgets `git reset --hard HEAD~1` first. Add `scripts/squash-attestation-chores.sh`:
+Re-sign cycles produce stacked `chore: sign v5 attestation` commits because the operator forgets `git reset --hard HEAD~1` first. Add a new helper script under `scripts/`:
 
 ```bash
 # When HEAD..HEAD~2 are both "chore: sign v5", squash to one
@@ -83,7 +83,7 @@ Invoke from `.husky/pre-push` defensively (idempotent).
 
 ### D. Branch-name truncation defense
 
-`gh pr list --json` returns truncated branch names in some output paths. Always resolve via `gh api repos/<owner>/<repo>/pulls/<n> --jq .head.ref` for the exact name. Document the rule in `docs/operations/merge-queue-rebase-recovery.md` + add a regression test in `scripts/check-branch-name-resolution.test.sh`.
+`gh pr list --json` returns truncated branch names in some output paths. Always resolve via `gh api repos/<owner>/<repo>/pulls/<n> --jq .head.ref` for the exact name. Document the rule in `docs/operations/merge-queue-rebase-recovery.md` + add a new regression-test helper under `scripts/`.
 
 ### E. check-orchestrator-state.sh: distinguish "behind on main" from "user-modified"
 
@@ -93,7 +93,7 @@ Parent repo in Pattern C should be on main. The script currently refuses to reco
 
 - [ ] **V5 root cause identified**: trace command shows whether v5 fails due to unreachable signedMergeBase OR diff mismatch
 - [ ] **V5 fix landed**: workflow `verify-attestation.yml` fetches signedMergeBase if not reachable; algorithm is verified-by-test to survive sibling merges of non-overlapping files
-- [ ] **Test for the v5 fix**: integration test that simulates "PR signed → sibling PR merges → verify-attestation still passes against original signedMergeBase"
+- [ ] **Test for the v5 fix**: integration test that simulates the rebase scenario — a signed PR's verify-attestation still passes against the original signedMergeBase even when main has advanced via a non-overlapping merge
 - [ ] **Auto-rearm workflow** lands and runs every 5min; tested by manually dequeueing a PR and watching it re-arm
 - [ ] **Squash-chore-sign helper** lands; manual re-sign cycles consolidate to one chore commit
 - [ ] **Branch-name resolution rule** documented + regression test
@@ -102,9 +102,9 @@ Parent repo in Pattern C should be on main. The script currently refuses to reco
 ## Out of scope
 
 - Replacing v5 with v6 (don't redesign — diagnose first)
-- Auto-rebase + auto-resign daemon (separate work, AISDLC-366 family)
+- Auto-rebase + auto-resign daemon (out of scope — separate orchestration work)
 - Operator UX to surface re-sign cycles in TUI (separate)
 
 ## Source
 
-Operator session 2026-05-19: ~30 manual re-sign cycles to ship 11 PRs because v5 doesn't survive sibling merges as designed. "We need consistent and predictable merges landing."
+Operator session 2026-05-19: ~30 manual re-sign cycles to ship 11 PRs because v5 doesn't survive concurrent merges as designed. "We need consistent and predictable merges landing."
