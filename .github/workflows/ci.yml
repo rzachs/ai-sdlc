@@ -18,6 +18,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# AISDLC-368: opt the workflow into Node 24 for JavaScript actions to silence
+# the actions/checkout@v4 + dorny/paths-filter@v3 Node 20 deprecation warning
+# that appeared on every job. Pure annotation-suppression — no behavior change.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 # AISDLC-218: skip every PR-event job when the PR is a draft. The guard
 # allows push (no PR context) + merge_group (always non-draft) through.
 jobs:
@@ -160,7 +166,10 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     strategy:
       matrix:
-        node-version: [20, 22]
+        # AISDLC-368: dropped Node 20 to halve Build & Test wall time.
+        # Node 22 is the canonical pin (engines.node ^22 across all packages);
+        # Node 20 was advisory-only and added ~5min per PR with little signal.
+        node-version: [22]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -218,6 +227,10 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
       - uses: actions/checkout@v4
+        with:
+          # AISDLC-368: full clone so `vitest --changed origin/main` can
+          # compute the diff and only run tests affected by changed files.
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -225,7 +238,18 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: pnpm test:coverage
+      # AISDLC-368: PR coverage runs ONLY for tests that touch changed files
+      # (vitest --changed origin/main). Cuts coverage job ~3-5min → ~30s on
+      # small PRs. push/merge_group still run full coverage so the codecov
+      # baseline stays accurate.
+      - name: Coverage (PR — changed files only)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin main:refs/remotes/origin/main || true
+          pnpm -r exec -- vitest run --coverage --changed origin/main || pnpm test:coverage
+      - name: Coverage (push / merge_group — full)
+        if: github.event_name != 'pull_request'
+        run: pnpm test:coverage
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
