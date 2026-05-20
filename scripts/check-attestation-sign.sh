@@ -102,6 +102,10 @@ fi
 TASK_ID_LOWER=$(printf '%s' "$TASK_ID" | tr '[:upper:]' '[:lower:]')
 VERDICT_DIR="$WT_ROOT/.ai-sdlc/verdicts"
 VERDICT_FILE=""
+# AISDLC-380 fix: track whether this verdict was synthesized for a docs-only PR.
+# When set to 1, Step 4d skips sub-attestation verification because docs-only
+# PRs have no reviewer fan-out by design.
+DOCS_ONLY_SYNTHESIZED=0
 for candidate in "$VERDICT_DIR/$TASK_ID_LOWER.json" "$VERDICT_DIR/$TASK_ID.json"; do
   if [ -f "$candidate" ]; then
     VERDICT_FILE="$candidate"
@@ -154,6 +158,10 @@ if [ -z "$VERDICT_FILE" ]; then
     echo "[attestation-sign] docs-only changeset detected — synthesizing auto-approved verdicts for $TASK_ID" >&2
     mkdir -p "$VERDICT_DIR"
     VERDICT_FILE="$VERDICT_DIR/$TASK_ID_LOWER.json"
+    # Mark as synthesized so Step 4d skips sub-attestation verification.
+    # Docs-only PRs have no reviewer fan-out by design (AISDLC-215),
+    # so there are no signed sub-attestations to verify.
+    DOCS_ONLY_SYNTHESIZED=1
     cat > "$VERDICT_FILE" <<'VERDICTS_EOF'
 [
   {"agentId":"code-reviewer","harness":"claude-code","approved":true,"findings":{"critical":0,"major":0,"minor":0,"suggestion":0},"summary":"Docs-only PR — auto-approved by check-attestation-sign.sh (AISDLC-215)"},
@@ -249,6 +257,84 @@ if [[ "${LAST_COMMIT_SUBJECT:-}" == "chore: auto-sign attestation for "* ]]; the
   # at the PARENT's HEAD-sha — not at the chore commit's own SHA. Skipping
   # here is correct: signing again would just produce a redundant envelope.
   exit 0
+fi
+
+# ── Step 4d: verify reviewer sub-attestations (AISDLC-380) ──────────
+#
+# Before invoking the signer, verify that the verdict file contains signed
+# sub-attestations from each reviewer — NOT plain fabricated JSON.
+#
+# The 2026-05-20 incident (AISDLC-377.1): a dev subagent wrote a verdict
+# file with `approved: true` for all 3 reviewers but no cryptographic proof
+# that the reviewers actually ran. The hook signed it, CI accepted it, and
+# 3 real majors shipped to main.
+#
+# Defense: `scripts/verify-reviewer-sub-attestations.mjs` checks each
+# sub-attestation's signature against `.ai-sdlc/trusted-reviewers.yaml`.
+# The verifier exits:
+#   0 → all sub-attestations verified (or AI_SDLC_LEGACY_VERDICTS=1 legacy mode)
+#   1 → verification failed; hook refuses to sign
+#   2 → internal error
+#
+# Test override: AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD can inject a stub.
+#
+# Skip when: DOCS_ONLY_SYNTHESIZED=1 (verdict was just synthesized by Step 3b
+# for a docs-only PR — there are no reviewer sub-attestations to verify because
+# docs-only PRs have no reviewer fan-out by design, AISDLC-215).
+TRUSTED_REVIEWERS_YAML="$WT_ROOT/.ai-sdlc/trusted-reviewers.yaml"
+VERIFY_SUB_ATT_SCRIPT="$WT_ROOT/scripts/verify-reviewer-sub-attestations.mjs"
+
+if [ "${DOCS_ONLY_SYNTHESIZED:-0}" = "1" ]; then
+  echo "[attestation-sign] docs-only synthesized verdict — skipping sub-attestation verification (no reviewer fan-out)" >&2
+elif [ -n "${AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD:-}" ] && [ "${AI_SDLC_TEST_MODE:-0}" = "1" ]; then
+  # Test override: use the stub verifier directly, bypassing file-existence checks.
+  # This lets tests exercise the hook's signing + commit logic without needing
+  # real verifier/registry files in the test repo. Production code never sets this.
+  # AISDLC-380 fix iter-3: GATE on AI_SDLC_TEST_MODE=1 so a dev subagent cannot
+  # set AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD=true to bypass the fail-CLOSED gate
+  # when verifier or registry files are missing (security-reviewer iter-2 finding).
+  echo "[attestation-sign] Verifying reviewer sub-attestations for $TASK_ID (using test override)" >&2
+  VERIFY_EXIT=0
+  # shellcheck disable=SC2086
+  $AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD \
+    --verdict-file "$VERDICT_FILE" \
+    --task-id "$TASK_ID" \
+    --trusted-reviewers "$TRUSTED_REVIEWERS_YAML" || VERIFY_EXIT=$?
+  if [ "$VERIFY_EXIT" -eq 1 ]; then
+    echo "[attestation-sign] ERROR: sub-attestation verification failed — refusing to sign" >&2
+    exit 2
+  elif [ "$VERIFY_EXIT" -ne 0 ]; then
+    echo "[attestation-sign] ERROR: sub-attestation verifier exited with unexpected code $VERIFY_EXIT" >&2
+    exit 2
+  fi
+elif [ ! -f "$VERIFY_SUB_ATT_SCRIPT" ]; then
+  # AISDLC-380 fix #3: fail-CLOSED when verifier missing — a dev could remove
+  # the script to disable the gate. Scripts dir is not in blockedPaths but this
+  # fail-CLOSED posture removes the bypass value.
+  echo "[attestation-sign] ERROR: $VERIFY_SUB_ATT_SCRIPT not found — refusing to sign (sub-attestation gate unavailable)" >&2
+  echo "[attestation-sign]        Restore the file or set AI_SDLC_SKIP_ATTESTATION_SIGN=1 to defer." >&2
+  exit 2
+elif [ ! -f "$TRUSTED_REVIEWERS_YAML" ]; then
+  # AISDLC-380 fix #3: fail-CLOSED when registry missing.
+  echo "[attestation-sign] ERROR: $TRUSTED_REVIEWERS_YAML not found — refusing to sign (trusted-reviewers registry missing)" >&2
+  echo "[attestation-sign]        Create the registry file or set AI_SDLC_SKIP_ATTESTATION_SIGN=1 to defer." >&2
+  exit 2
+else
+  echo "[attestation-sign] Verifying reviewer sub-attestations for $TASK_ID" >&2
+  VERIFY_EXIT=0
+  node "$VERIFY_SUB_ATT_SCRIPT" \
+    --verdict-file "$VERDICT_FILE" \
+    --task-id "$TASK_ID" \
+    --trusted-reviewers "$TRUSTED_REVIEWERS_YAML" || VERIFY_EXIT=$?
+  if [ "$VERIFY_EXIT" -eq 1 ]; then
+    echo "[attestation-sign] ERROR: sub-attestation verification failed — refusing to sign" >&2
+    echo "[attestation-sign]        Re-run reviewer subagents to produce signed sub-attestations." >&2
+    echo "[attestation-sign]        Emergency legacy escape: AI_SDLC_LEGACY_VERDICTS=1 git push" >&2
+    exit 2
+  elif [ "$VERIFY_EXIT" -ne 0 ]; then
+    echo "[attestation-sign] ERROR: sub-attestation verifier exited with unexpected code $VERIFY_EXIT" >&2
+    exit 2
+  fi
 fi
 
 # ── Step 5: invoke the signer ────────────────────────────────────────

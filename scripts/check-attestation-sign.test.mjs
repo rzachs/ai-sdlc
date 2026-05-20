@@ -39,6 +39,19 @@ function cleanEnv(extra = {}) {
   // AISDLC-250: don't inherit CODEX_VERSION from the host env so tests that
   // assert the "absent" path are hermetic even when the operator has exported it.
   delete env.CODEX_VERSION;
+  // AISDLC-380: existing tests focus on logic other than sub-attestation
+  // verification. Use a stub verifier that always exits 0 so the test's
+  // verdict files (legacy plain-JSON shape) pass through without signature
+  // checking. Tests that specifically test sub-attestation verification
+  // unset AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD in their env overrides.
+  //
+  // AISDLC-380 iter-3: the hook now gates the override on AI_SDLC_TEST_MODE=1
+  // so a dev subagent cannot use it to bypass the fail-CLOSED gate. Tests must
+  // therefore also set AI_SDLC_TEST_MODE=1 when using the override.
+  if (!('AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD' in extra)) {
+    env.AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD = 'true';
+    env.AI_SDLC_TEST_MODE = '1';
+  }
   for (const [k, v] of Object.entries(extra)) env[k] = v;
   return env;
 }
@@ -568,6 +581,248 @@ describe('check-attestation-sign.sh (AISDLC-133)', () => {
         false,
         `chore commit body must not contain "${tok}": ${body}`,
       );
+    }
+  });
+
+  // ── AISDLC-380 Bug #2: docs-only post-380 regression ─────────────────────
+  //
+  // After AISDLC-380 added sub-attestation verification (Step 4d), the
+  // synthesized docs-only plain-JSON verdict was being passed to the verifier,
+  // which classified it as legacy and refused to sign. The fix sets
+  // DOCS_ONLY_SYNTHESIZED=1 so Step 4d is skipped for synthesized verdicts.
+
+  it('AISDLC-380 Bug#2: docs-only PR succeeds after sub-attestation gate added', () => {
+    // A docs-only commit with no verdict file. The hook must synthesize verdicts
+    // AND skip sub-attestation verification (because docs-only PRs have no
+    // reviewer fan-out). The sign step must proceed and exit 1 (re-push).
+    mkdirSync(join(root, 'docs'), { recursive: true });
+    writeFileSync(join(root, 'docs', 'guide2.md'), '# Guide 2\nContent.\n');
+    git(['add', '.'], root);
+    git(['commit', '-q', '-m', 'docs: add guide2'], root);
+
+    writeFileSync(join(root, '.active-task'), 'AISDLC-380B\n');
+    // No verdict file — docs-only path.
+
+    // Set up trusted-reviewers.yaml with reviewer entries so the verifier
+    // would normally require sub-attestations.
+    mkdirSync(join(root, '.ai-sdlc'), { recursive: true });
+    writeFileSync(
+      join(root, '.ai-sdlc', 'trusted-reviewers.yaml'),
+      `# Test\nreviewers:\n  - type: 'reviewer'\n    reviewer: 'code-reviewer'\n    machine: 'testmachine'\n    addedAt: '2026-05-20'\n    addedBy: 'test'\n    pubkey: |\n      -----BEGIN PUBLIC KEY-----\n      MCowBQYDK2VwAyEA7RfNqQjnRnt7dG0gjIWIkqyfvn+/aMycmbaEbq7lS7E=\n      -----END PUBLIC KEY-----\n`,
+    );
+
+    // Copy verify script so the hook can find it.
+    mkdirSync(join(root, 'scripts'), { recursive: true });
+    execFileSync('cp', [
+      join(__dirname, 'verify-reviewer-sub-attestations.mjs'),
+      join(root, 'scripts', 'verify-reviewer-sub-attestations.mjs'),
+    ]);
+
+    // Install the REAL verifier and a registry with reviewer entries, so that
+    // if the DOCS_ONLY_SYNTHESIZED bypass fails, the hook would exit 2.
+    mkdirSync(join(root, 'scripts'), { recursive: true });
+    execFileSync('cp', [
+      join(__dirname, 'verify-reviewer-sub-attestations.mjs'),
+      join(root, 'scripts', 'verify-reviewer-sub-attestations.mjs'),
+    ]);
+    mkdirSync(join(root, '.ai-sdlc'), { recursive: true });
+    writeFileSync(
+      join(root, '.ai-sdlc', 'trusted-reviewers.yaml'),
+      `# Test\nreviewers:\n  - type: 'reviewer'\n    reviewer: 'code-reviewer'\n    machine: 'testmachine'\n    addedAt: '2026-05-20'\n    addedBy: 'test'\n    pubkey: |\n      -----BEGIN PUBLIC KEY-----\n      MCowBQYDK2VwAyEA7RfNqQjnRnt7dG0gjIWIkqyfvn+/aMycmbaEbq7lS7E=\n      -----END PUBLIC KEY-----\n`,
+    );
+
+    const { cmd } = installFakeSigner(root);
+    const r = runHook(root, {
+      AI_SDLC_SIGN_ATTESTATION_CMD: cmd,
+      // Unset the default stub so the real verifier is used via the file path.
+      // This tests that docs-only skips sub-attestation verification via
+      // DOCS_ONLY_SYNTHESIZED=1, NOT by having the stub bypass it.
+      AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD: '',
+    });
+
+    // The hook must succeed (exit 1 = signed + re-push needed, NOT exit 2 = refused).
+    assert.equal(
+      r.status,
+      1,
+      `expected exit 1 (docs-only auto-signed), got ${r.status}: stderr=${r.stderr}`,
+    );
+    assert.match(
+      r.stderr,
+      /docs-only changeset detected/i,
+      `stderr must confirm docs-only: ${r.stderr}`,
+    );
+    // Must NOT emit sub-attestation verification failure.
+    assert.equal(
+      r.stderr.includes('sub-attestation verification failed'),
+      false,
+      `docs-only must NOT hit sub-attestation verification: ${r.stderr}`,
+    );
+  });
+
+  // ── AISDLC-380 Bug #3: fail-CLOSED when verifier or registry missing ──────
+
+  it('AISDLC-380 Bug#3: exits 2 when verify-reviewer-sub-attestations.mjs is missing', () => {
+    // When the verifier script is absent (e.g. dev deleted it), the hook must
+    // refuse to sign (exit 2) rather than warn and continue (old behavior).
+    // Use a fresh repo without the verifier script installed.
+    const bareRoot = mkdtempSync(join(tmpdir(), 'ai-sdlc-att-bare-'));
+    try {
+      git(['init', '-q', '-b', 'main'], bareRoot);
+      git(['config', 'user.email', 'test@test.com'], bareRoot);
+      git(['config', 'user.name', 'test'], bareRoot);
+      git(['config', 'commit.gpgsign', 'false'], bareRoot);
+      writeFileSync(join(bareRoot, 'README.md'), 'baseline\n');
+      git(['add', '.'], bareRoot);
+      git(['commit', '-q', '-m', 'baseline'], bareRoot);
+      git(['update-ref', 'refs/remotes/origin/main', 'HEAD'], bareRoot);
+
+      writeFileSync(join(bareRoot, '.active-task'), 'AISDLC-380C\n');
+
+      // Write a verdict file.
+      const dir = join(bareRoot, '.ai-sdlc', 'verdicts');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'aisdlc-380c.json'),
+        JSON.stringify([
+          { agentId: 'code-reviewer', approved: true, findings: [], summary: 'test' },
+        ]),
+      );
+
+      // Set up trusted-reviewers.yaml but NO verifier script.
+      writeFileSync(join(bareRoot, '.ai-sdlc', 'trusted-reviewers.yaml'), 'reviewers:\n');
+
+      const { cmd } = installFakeSigner(bareRoot);
+      const r = runHook(bareRoot, {
+        AI_SDLC_SIGN_ATTESTATION_CMD: cmd,
+        // Explicitly unset the stub so the hook exercises the file-existence check.
+        AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD: '',
+      });
+
+      assert.equal(
+        r.status,
+        2,
+        `expected exit 2 (fail-CLOSED: verifier missing), got ${r.status}: stderr=${r.stderr}`,
+      );
+      assert.match(
+        r.stderr,
+        /verify-reviewer-sub-attestations\.mjs.*not found|sub-attestation gate unavailable/i,
+        `stderr must explain verifier is missing: ${r.stderr}`,
+      );
+    } finally {
+      rmSync(bareRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('AISDLC-380 Bug#3: exits 2 when .ai-sdlc/trusted-reviewers.yaml is missing', () => {
+    // Use a fresh repo with verifier but no registry.
+    const bareRoot = mkdtempSync(join(tmpdir(), 'ai-sdlc-att-bare2-'));
+    try {
+      git(['init', '-q', '-b', 'main'], bareRoot);
+      git(['config', 'user.email', 'test@test.com'], bareRoot);
+      git(['config', 'user.name', 'test'], bareRoot);
+      git(['config', 'commit.gpgsign', 'false'], bareRoot);
+      writeFileSync(join(bareRoot, 'README.md'), 'baseline\n');
+      git(['add', '.'], bareRoot);
+      git(['commit', '-q', '-m', 'baseline'], bareRoot);
+      git(['update-ref', 'refs/remotes/origin/main', 'HEAD'], bareRoot);
+
+      writeFileSync(join(bareRoot, '.active-task'), 'AISDLC-380D\n');
+
+      const dir = join(bareRoot, '.ai-sdlc', 'verdicts');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'aisdlc-380d.json'),
+        JSON.stringify([
+          { agentId: 'code-reviewer', approved: true, findings: [], summary: 'test' },
+        ]),
+      );
+
+      // Copy verify script but DO NOT write trusted-reviewers.yaml.
+      mkdirSync(join(bareRoot, 'scripts'), { recursive: true });
+      execFileSync('cp', [
+        join(__dirname, 'verify-reviewer-sub-attestations.mjs'),
+        join(bareRoot, 'scripts', 'verify-reviewer-sub-attestations.mjs'),
+      ]);
+      // .ai-sdlc dir exists but no trusted-reviewers.yaml file.
+      mkdirSync(join(bareRoot, '.ai-sdlc'), { recursive: true });
+
+      const { cmd } = installFakeSigner(bareRoot);
+      const r = runHook(bareRoot, {
+        AI_SDLC_SIGN_ATTESTATION_CMD: cmd,
+        // Explicitly unset the stub to test the file-existence check path.
+        AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD: '',
+      });
+
+      assert.equal(
+        r.status,
+        2,
+        `expected exit 2 (fail-CLOSED: registry missing), got ${r.status}: stderr=${r.stderr}`,
+      );
+      assert.match(
+        r.stderr,
+        /trusted-reviewers\.yaml.*not found|trusted-reviewers registry missing/i,
+        `stderr must explain registry is missing: ${r.stderr}`,
+      );
+    } finally {
+      rmSync(bareRoot, { recursive: true, force: true });
+    }
+  });
+
+  // ── AISDLC-380 iter-3: env-override must require AI_SDLC_TEST_MODE=1 ────
+
+  it('AISDLC-380 iter-3: AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD without AI_SDLC_TEST_MODE=1 does NOT bypass fail-CLOSED', () => {
+    // Security-reviewer iter-2 finding: the env-override branch was placed
+    // before the fail-CLOSED file-existence checks. A dev could set
+    // AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD=true to bypass the gate even
+    // when the verifier or registry was missing. The iter-3 fix gates the
+    // override on AI_SDLC_TEST_MODE=1. This test asserts the gate fires:
+    // setting the override WITHOUT the test-mode flag falls through to
+    // the fail-CLOSED file-existence checks.
+    const bareRoot = mkdtempSync(join(tmpdir(), 'ai-sdlc-att-iter3-'));
+    try {
+      git(['init', '-q', '-b', 'main'], bareRoot);
+      git(['config', 'user.email', 'test@test.com'], bareRoot);
+      git(['config', 'user.name', 'test'], bareRoot);
+      git(['config', 'commit.gpgsign', 'false'], bareRoot);
+      writeFileSync(join(bareRoot, 'README.md'), 'baseline\n');
+      git(['add', '.'], bareRoot);
+      git(['commit', '-q', '-m', 'baseline'], bareRoot);
+      git(['update-ref', 'refs/remotes/origin/main', 'HEAD'], bareRoot);
+
+      writeFileSync(join(bareRoot, '.active-task'), 'AISDLC-380E\n');
+
+      const dir = join(bareRoot, '.ai-sdlc', 'verdicts');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'aisdlc-380e.json'),
+        JSON.stringify([
+          { agentId: 'code-reviewer', approved: true, findings: [], summary: 'test' },
+        ]),
+      );
+
+      // No verifier script, no registry — fail-CLOSED conditions met.
+      // BUT dev sets the override hoping to bypass. Without TEST_MODE=1
+      // the override is ignored and the hook exits 2.
+      const { cmd } = installFakeSigner(bareRoot);
+      const r = runHook(bareRoot, {
+        AI_SDLC_SIGN_ATTESTATION_CMD: cmd,
+        AI_SDLC_VERIFY_SUB_ATTESTATIONS_CMD: 'true',
+        // NOTE: AI_SDLC_TEST_MODE intentionally NOT set.
+        AI_SDLC_TEST_MODE: '',
+      });
+
+      assert.equal(
+        r.status,
+        2,
+        `expected exit 2 (override ignored without TEST_MODE), got ${r.status}: stderr=${r.stderr}`,
+      );
+      assert.match(
+        r.stderr,
+        /not found|sub-attestation gate unavailable|trusted-reviewers registry missing/i,
+        `stderr must show fail-CLOSED path, not test-override path: ${r.stderr}`,
+      );
+    } finally {
+      rmSync(bareRoot, { recursive: true, force: true });
     }
   });
 

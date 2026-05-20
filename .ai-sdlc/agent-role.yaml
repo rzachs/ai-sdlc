@@ -21,6 +21,12 @@ spec:
     blockedPaths:
       - '.github/workflows/**'
       - '.ai-sdlc/**'
+      # AISDLC-380 fix #3: block Write/Edit on attestation gate scripts so a dev
+      # subagent cannot disable sub-attestation verification by modifying them.
+      # Note: blockedPaths only prevents Write/Edit tool calls, not Bash `rm`
+      # (Bash-pattern gap deferred to AISDLC-380.2).
+      - 'scripts/verify-reviewer-sub-attestations.mjs'
+      - 'scripts/verify-attestation.mjs'
     blockedActions:
       - 'gh pr merge*'
       - 'git merge*'
@@ -33,3 +39,11 @@ spec:
       - 'git reset --hard*'
       - 'git checkout -- .'
       - 'git restore .'
+      # AISDLC-380: deny access to reviewer signing keys directory.
+      # Reviewer sub-attestation keys live at ~/.ai-sdlc/reviewer-keys/.
+      # This blockedAction raises the bar from "trivial accident" to
+      # "deliberate workaround" for a dev subagent trying to forge
+      # reviewer sub-attestations. See docs/operations/reviewer-signing-key-runbook.md
+      # for the residual-risk note.
+      - '*reviewer-keys*'
+      - '*~/.ai-sdlc/reviewer-keys*'

@@ -54,3 +54,54 @@ Return a JSON object:
 ```
 
 **Only flag issues with a plausible attack vector. "Theoretically possible" is not sufficient — describe the attack.**
+
+## Sub-attestation (AISDLC-380 — KNOWN LIMITATION)
+
+**The security-reviewer agent is EXEMPT from sub-attestation signing in this PR.**
+
+### Why
+
+`security-reviewer.md` declares `disallowedTools: [Bash]` — the Bash tool is required to
+invoke the sign helper (`sign-reviewer-verdict.mjs`). Granting Bash to the security-reviewer
+is architecturally undesirable: the security reviewer's read-only constraint is a deliberate
+trust boundary (read the code, don't run it).
+
+Claude Code plugin agent frontmatter does NOT currently support per-command Bash allowlists,
+so Option A (narrow Bash allowlist) is infeasible without harness changes (deferred to AISDLC-380.2).
+
+### Option B (current — exemption marker)
+
+Return your verdict JSON WITHOUT a sub-attestation. The slash command body MUST include the
+unsigned entry in the aggregate verdict file with the following extra fields:
+
+```json
+{
+  "reviewerName": "security-reviewer",
+  "unsigned": true,
+  "exemptReason": "no-bash-tool",
+  "verdict": { "approved": true, "findings": [...], "summary": "..." }
+}
+```
+
+The verifier (`verify-reviewer-sub-attestations.mjs`) accepts unsigned entries ONLY when:
+- `reviewerName === 'security-reviewer'` AND `unsigned === true` AND `exemptReason === 'no-bash-tool'`
+
+All other reviewer entries (code-reviewer, test-reviewer) MUST be signed.
+
+This gap is documented in `docs/operations/reviewer-signing-key-runbook.md` and will be
+closed in AISDLC-380.2 when the harness supports per-command Bash allowlists or a
+read-only signing side-channel is available.
+
+**Return value to the slash command body:**
+
+Return a plain JSON object (no sub-attestation):
+```json
+{
+  "approved": true,
+  "findings": [...],
+  "summary": "..."
+}
+```
+
+The slash command body wraps this in the unsigned-exempt envelope above before writing to
+`.ai-sdlc/verdicts/<task-id>.json`.
