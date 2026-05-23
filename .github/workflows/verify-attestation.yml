@@ -126,16 +126,15 @@ on:
     # the envelope is signed.
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
-  # AISDLC-113: also verify inside the merge-queue's gh-readonly-queue branch
-  # so a sibling PR merging into the same files between PR-head verification
-  # and merge-queue execution is still surfaced in the audit log. merge_group
-  # events always run in target-repo context already (no fork-token-downgrade
-  # quirk) so they're unaffected by the AISDLC-381 migration.
-  merge_group:
-    types: [checks_requested]
+  # AISDLC-400 (2026-05-23): merge_group trigger removed. The GitHub merge queue
+  # was dropped in AISDLC-400; there are no longer gh-readonly-queue/* probe
+  # SHAs to verify against. PRs merge directly via auto-merge (squash) once
+  # required checks pass. The rollback path: re-enable "Require merge queue"
+  # in Settings → Branches → main branch protection and restore the merge_group
+  # trigger here. See docs/operations/merge-without-queue.md.
 
 concurrency:
-  group: verify-attestation-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
+  group: verify-attestation-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:

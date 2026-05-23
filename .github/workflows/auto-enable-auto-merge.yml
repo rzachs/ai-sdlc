@@ -1,10 +1,19 @@
 name: Auto-enable auto-merge on PR open
 
-# Enables GitHub's auto-merge on every new PR from a branch in this repo.
-# Once required checks pass and required reviews are satisfied, GitHub
-# adds the PR to the merge queue (since the queue is enabled on `main`),
-# which then rebases against the queue tip + runs CI on the merge commit
-# + merges if green. No human click needed.
+# Enables GitHub's auto-merge (squash) on every new PR from a branch in this
+# repo. Once required checks pass and required reviews are satisfied, GitHub
+# squash-merges the PR directly — no merge queue involved.
+#
+# AISDLC-400 (2026-05-23): The GitHub merge queue was dropped. Operator
+# architectural review determined the queue's benefits (serialized merges,
+# pre-merge skew testing, atomic transactions) solve problems this repo does
+# not have (1-5 PRs in flight, solo operator + agents, mostly disjoint files).
+# Queue costs (1x throughput, 10-15 min update-branch CI re-run per PR,
+# merge_group event complexity) were felt acutely. Direct auto-merge is now
+# the merge path. Required checks (`ai-sdlc/pr-ready`, `Backlog Drift`) and
+# squash-only repo settings provide equivalent safety. See
+# docs/operations/merge-without-queue.md for the full rationale and rollback
+# procedure.
 #
 # ── AISDLC-381: pull_request_target migration (fork-PR support) ──────
 # This workflow fires on `pull_request_target` (NOT `pull_request`) so that
@@ -38,35 +47,14 @@ name: Auto-enable auto-merge on PR open
 #    a step that consumes fork-controlled input). The PAT is used solely
 #    for the `gh pr merge` API call which is target-repo-scoped.
 #
-# Why no `--rebase` / `--squash` flag (AISDLC-221, 2026-05-06):
-# GitHub's merge-queue ruleset on `main` now ENFORCES its configured
-# strategy (currently SQUASH) on every auto-merge arming and overrides
-# any flag passed here — verified empirically: re-arming with
-# `gh pr merge --auto --rebase` returned `! The merge strategy for main
-# is set by the merge queue`. The queue's strategy applies whether we
-# pass --rebase, --squash, or no flag. Earlier-session traps where PRs
-# sat MERGEABLE/UNSTABLE forever (PRs #311/#312/#292/#326/#327/#328) no
-# longer reproduce because GitHub now serializes auto-merge through the
-# queue's strategy.
-#
-# Verify the current queue strategy via:
-#   gh api graphql -f query='{ repository(owner:"<org>", name:"<repo>") { mergeQueue(branch:"main") { configuration { mergeMethod } } } }'
-# Or: GitHub UI → Settings → Rulesets → main → Merge Queue.
-#
-# By dropping the flag we let the queue dictate. If the queue's strategy
-# is ever flipped from SQUASH to REBASE in repo settings, no workflow
-# change is needed — auto-merge just follows.
-#
-# CAVEAT: prior to ruleset enforcement, the no-flag path WAS a trap —
-# `gh pr merge --auto` (no flag) fell back to the viewer's
-# `viewerDefaultMergeMethod`, which often matched the queue's method
-# and caused the same MERGEABLE/UNSTABLE deadlock. If GitHub ever
-# weakens ruleset enforcement, restore the explicit-flag workaround
-# (whichever method the queue is NOT using).
-#
-# AISDLC-221 captures the current rationale; AISDLC-192 captures the
-# legacy "method-must-differ" analysis (no longer load-bearing while
-# ruleset enforcement holds).
+# Why `--squash` (AISDLC-400, 2026-05-23):
+# With the merge queue dropped, we explicitly pass `--squash` so PRs
+# always land as a single commit on main regardless of repo-default
+# settings. This matches the previous queue behavior (queue used SQUASH
+# strategy). Operator must also set "Default merge method: Squash" in
+# Settings → General → Pull requests and disable merge commits + rebase
+# merges there for defense-in-depth. See scripts/sync-branch-protection.sh
+# for the idempotent automation.
 #
 # Why a workflow (vs the per-PR button): the repo-level "Allow auto-merge"
 # setting just enables the BUTTON. It doesn't actually opt PRs into auto-merge.
@@ -85,15 +73,15 @@ name: Auto-enable auto-merge on PR open
 #
 # AISDLC-230 (2026-05-07): also re-fire on `check_suite.completed` and
 # `status` events. Without these, when CI completes AFTER auto-merge was
-# armed, GitHub's queue-admission logic can leave the PR sitting CLEAN +
-# armed but never actually queued — operators report needing to manually
-# `gh pr merge --disable-auto && gh pr merge --auto` to force a fresh
-# evaluation. By re-running the disable-then-arm cycle on every CI
+# armed, GitHub's direct-merge admission logic can leave the PR sitting
+# CLEAN + armed but never actually merged — operators report needing to
+# manually `gh pr merge --disable-auto && gh pr merge --auto` to force a
+# fresh evaluation. By re-running the disable-then-arm cycle on every CI
 # completion, the workflow self-heals that staleness without operator
 # intervention. The disable-then-arm cycle (vs bare `--auto`) is required
 # because bare `--auto` is idempotent — calling it on an already-armed
 # stale state is a no-op. `--disable-auto` followed by `--auto` is what
-# clears GitHub's cached state and triggers immediate queue admission.
+# clears GitHub's cached state and triggers immediate merge admission.
 
 on:
   # AISDLC-381: migrated from `pull_request` to `pull_request_target` so
@@ -218,7 +206,11 @@ jobs:
         run: |
           # AISDLC-230: bare `gh pr merge --auto` is idempotent on
           # already-armed PRs and won't clear stale GitHub state, so
-          # disable-then-arm is required to refresh queue admission.
+          # disable-then-arm is required to refresh direct-merge admission.
           # `|| true` on disable handles the "wasn't armed yet" case.
+          #
+          # AISDLC-400: explicit --squash flag. With the merge queue dropped,
+          # we pass --squash directly so PRs always land as a single commit on
+          # main regardless of repo-default settings drift.
           gh pr merge --disable-auto "$PR" 2>/dev/null || true
-          gh pr merge --auto "$PR"
+          gh pr merge --auto --squash "$PR"

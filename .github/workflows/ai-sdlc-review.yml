@@ -97,17 +97,17 @@ on:
       - 'backlog/tasks/**'
       - 'backlog/completed/**'
       - '*.md'
-  # AISDLC-214: also fire on merge_group so we can post `Post Review Results`
-  # on docs-only queue commits (branch protection requires the check even on
-  # merge_group head SHAs). `paths-ignore` does NOT apply to merge_group events,
-  # so the docs-only-check job below handles the predicate inline and short-circuits
-  # with success. The PR-review jobs (attestation-precheck, analyze, etc.) are
-  # gated on pull_request only and do not run on merge_group.
-  merge_group:
-    types: [checks_requested]
+  # AISDLC-400 (2026-05-23): merge_group trigger removed. The GitHub merge queue
+  # was dropped; there are no longer gh-readonly-queue/* probe SHAs to cover.
+  # PRs merge directly via auto-merge (squash) once required checks on the PR
+  # head pass. The merge-queue-passthrough.yml workflow (which also handled
+  # merge_group passthrough) is now a no-op and can be deleted after this PR
+  # merges. Rollback: restore the merge_group trigger here and re-enable the
+  # merge queue in Settings → Branches → main. See
+  # docs/operations/merge-without-queue.md.
 
 concurrency:
-  group: review-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
+  group: review-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:

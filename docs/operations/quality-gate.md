@@ -1,8 +1,9 @@
 # Quality Gate — `ai-sdlc/pr-ready` aggregator
 
-**Status:** Active (additive deployment as of AISDLC-140 sub-1; cutover pending)
+**Status:** Active (no-queue direct-merge model as of AISDLC-400, 2026-05-23)
 **Audience:** AI-SDLC operators and adopters configuring branch protection on a protected branch.
 **Companion:** `.github/workflows/ai-sdlc-gate.yml`, `.github/workflows/__tests__/ai-sdlc-gate.test.mjs`
+**Merge flow:** See `docs/operations/merge-without-queue.md` for the direct-merge runbook.
 
 ---
 
@@ -15,7 +16,7 @@ Backlog Drift
 ai-sdlc/pr-ready
 ```
 
-`ai-sdlc/pr-ready` is the rollup of every PR signal AI-SDLC needs (lint, build, test on Node 22, coverage, integration tests). `Backlog Drift` is a standalone CI job that catches dangling task references. The rollup runs on both `pull_request` and `merge_group` events, so it works whether or not you have GitHub Merge Queue enabled.
+`ai-sdlc/pr-ready` is the rollup of every PR signal AI-SDLC needs (lint, build, test on Node 22, coverage, integration tests). `Backlog Drift` is a standalone CI job that catches dangling task references. The rollup runs on `pull_request` events (no merge queue required — AISDLC-400 dropped the queue in favour of direct auto-merge with squash).
 
 **`ai-sdlc/attestation` is NO LONGER a direct required check** (AISDLC-388). Attestation is a conditional contributor to `ai-sdlc/pr-ready`: code PRs require it (verify-attestation.yml runs and its `ai-sdlc/attestation` status is an informational governance signal operators must review before merging), but docs-only PRs skip it entirely — no status needs to be posted. This eliminates the workaround class where docs PRs had to have a synthetic attestation status posted (AISDLC-214 short-circuit + AISDLC-215 synthesis, now deleted).
 
@@ -283,7 +284,7 @@ This is overkill for AI-SDLC's own dogfood repo (single-dev, low PR volume, fast
    - **Spurious flake** → re-run; if it doesn't reproduce, document and continue. If flake rate exceeds 1-2%, fix the underlying flake before cutover.
 5. **Cut over** once the comparison window is clean.
 
-For repos with a merge queue enabled (GHMQ, Mergify, Aviator), repeat the comparison for `merge_group` events too — the aggregator runs on both, but adopters with custom queue configs may have different behavior between the PR-time and queue-time evaluations.
+For repos with a merge queue enabled (GHMQ, Mergify, Aviator), add `merge_group: types: [checks_requested]` back to `ai-sdlc-gate.yml`'s `on:` block — the aggregator was written to handle both events and the logic is preserved in git history (AISDLC-400 removed it for the direct-merge path). Repeat the shadow-mode comparison for `merge_group` events in that case.
 
 ## Adopter scaffolding (sub-5)
 

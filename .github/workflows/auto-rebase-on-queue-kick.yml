@@ -1,20 +1,29 @@
 name: Auto-rebase + re-arm on merge-queue attestation kick
 
+# AISDLC-400 (2026-05-23): THIS WORKFLOW IS SUPERSEDED AND INERT.
+# The GitHub merge queue was dropped in AISDLC-400. There are no longer
+# `gh-readonly-queue/main/pr-<N>-<sha>` probe SHAs to monitor, so this
+# workflow's job-level guard (`github.event.context == 'ai-sdlc/attestation'
+# && github.event.state == 'failure'`) will never act on a queue probe SHA.
+# The workflow continues to listen on `status` events (non-breaking to remove)
+# but exits cheaply at the job-level guard for every event.
+#
+# TODO: delete this file entirely in a follow-up cleanup PR once the team
+# confirms no queue-related status events are expected.
+#
+# ── Original purpose (AISDLC-360, now irrelevant) ──────────────────────
 # AISDLC-360: when the merge queue posts `ai-sdlc/attestation: failure` on a
 # `gh-readonly-queue/main/pr-<N>-<sha>` probe SHA (= a queue rebase invalidated
 # the v5/v4 hash because a sibling PR overlapped with this PR's files), the
 # queue silently evicts the PR and the operator must manually re-arm
 # `gh pr merge --auto`. With AISDLC-362's contentHashV5 closing the
 # non-overlapping case, only OVERLAPPING (same-file) sibling merges still
-# reach this path — but each one costs 3 cycles of the autonomous loop:
-#   N:   tick fires; PR sits dequeued, waiting for operator
-#   N+1: operator rebases + re-signs + force-pushes
-#   N+2: queue picks up rebased PR; new probe runs
+# reached this path.
 #
-# This workflow closes that loop: on the failure status event, identify
-# the source PR, kick `gh pr update-branch --rebase` (which triggers the
-# pre-push attestation-sign hook → fresh envelope on the rebased SHA),
-# then re-arm `gh pr merge --auto --rebase`.
+# The queue was replaced by direct auto-merge (squash) per AISDLC-400.
+# AISDLC-398's content-addressed envelopes (headBlobSha-based, base-independent)
+# eliminate the v4-kick concern entirely — envelopes survive any commit-SHA
+# change. See docs/operations/merge-without-queue.md for the new flow.
 #
 # ── Trigger ────────────────────────────────────────────────────────────
 # `status` event with `context: ai-sdlc/attestation` and `state: failure`.

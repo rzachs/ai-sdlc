@@ -65,12 +65,16 @@ on:
     # rollup) skip draft opens, so the original 2-CI-runs-per-draft-PR problem
     # AISDLC-218 fixed doesn't recur.
     types: [opened, synchronize, reopened, ready_for_review]
-  merge_group:
-    types: [checks_requested]
+  # AISDLC-400 (2026-05-23): merge_group trigger removed. The GitHub merge queue
+  # was dropped; PRs now merge directly via auto-merge (squash) once required
+  # checks on the PR head pass. There are no merge-queue probe SHAs to gate
+  # against. Rollback: restore the merge_group trigger here and re-enable the
+  # merge queue in Settings → Branches → main. See
+  # docs/operations/merge-without-queue.md.
 
-# One in-flight gate run per PR / merge-queue head; cancel superseded runs.
+# One in-flight gate run per PR; cancel superseded runs.
 concurrency:
-  group: ai-sdlc-gate-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  group: ai-sdlc-gate-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -199,10 +203,10 @@ jobs:
     # against) AND on PRs from forks (which lack repo secrets needed for
     # the reference adapter integration tests). Same predicate as
     # `ci.yml`'s `integration` job — kept in sync deliberately.
+    # AISDLC-400: merge_group branch removed (no queue); only skip forks.
     if: |
       needs.detect.outputs.docs_only != 'true' &&
-      (github.event_name == 'merge_group' ||
-       github.event.pull_request.head.repo.full_name == github.repository)
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -24,7 +24,7 @@ GitHub Actions silently skips ALL workflows when ANY commit body contains `[skip
 - **Never merge PRs** — only humans merge.
 - **Never close** issues or PRs. **Never force-push to main/master.**
 - Dismiss stale reviews only with documented reason (truncation, API errors).
-- `auto-enable-auto-merge.yml` sets `--auto` on same-repo PRs (no method flag — the merge-queue ruleset on `main` enforces its configured strategy and overrides any flag passed by the workflow). Currently the queue is SQUASH so PRs land as one commit on main; if the queue's strategy is ever flipped in repo settings, no workflow change is needed. Setting `--auto` is NOT merging. (Legacy `--rebase` workaround retired in AISDLC-221 — GitHub now serializes auto-merge through the queue strategy, so the old "method-must-differ" trap no longer reproduces.)
+- `auto-enable-auto-merge.yml` sets `--auto --squash` on same-repo PRs (AISDLC-400: merge queue dropped 2026-05-23; explicit `--squash` ensures PRs always land as one commit on main regardless of repo-default drift). Setting `--auto` is NOT merging. PRs merge directly once `ai-sdlc/pr-ready` + `Backlog Drift` required checks pass — no merge-queue serialization, no update-branch CI re-run. AISDLC-398's content-addressed envelopes (headBlobSha-based, base-independent) eliminate v4-kick permanently. See `docs/operations/merge-without-queue.md` for the full flow and rollback procedure.
 
 ## Testing
 
