@@ -51,6 +51,24 @@
  *     --iteration-budget <n>` — Conductor escalation when an
  *     `iterate-needed` verdict lands at the budget cap.
  *
+ * Pattern X (AISDLC-396) — in-session background Agent dispatch:
+ *
+ *   - `dispatch-bg-agent --manifest-path <path> [--max-sessions <n>]` —
+ *     Conductor's Step 5 entry point. Reads the manifest, enforces the
+ *     in-session-agent concurrency cap, and writes a synthetic
+ *     bg-agent-request/<task-id>.json describing the dev dispatch. The
+ *     slash command body's Step 2.5 sweep picks this up and fires the
+ *     actual `Agent` tool call (filesystem coordination because plugin
+ *     subagents can't use `Agent` — AISDLC-98).
+ *   - `list-bg-agent-requests` — slash command body Step 2.5 sweep.
+ *     Returns oldest-first JSON array of pending requests.
+ *   - `remove-bg-agent-request --task-id <id>` — slash command body
+ *     deletes the request after firing the Agent call. Idempotent.
+ *   - `prune-orphaned-bg-agent-requests` — GC requests whose corresponding
+ *     inflight manifest has been reaped by stale-heartbeat sweeper.
+ *   - `count-in-flight-bg-agents` — Conductor's backpressure probe.
+ *     Returns the deduplicated count of inflight + pending requests.
+ *
  * All subcommands accept `--board-dir <path>` (defaults to
  * `.ai-sdlc/dispatch` relative to the current working directory). Output
  * is always JSON on stdout so slash command bodies can parse it with
@@ -87,6 +105,15 @@ import type {
   VerdictOutcome,
   WorkerKind,
 } from '../dispatch/index.js';
+import { loadDispatchConfig } from '../dispatch/recommend-worker.js';
+import {
+  countInFlightBgAgents,
+  DEFAULT_IN_SESSION_AGENT_MAX_SESSIONS,
+  listBgAgentRequests,
+  pruneOrphanedBgAgentRequests,
+  removeBgAgentRequest,
+  writeBgAgentRequest,
+} from '../orchestrator/dispatch-bg-agent.js';
 
 /**
  * Minimal argv parser — yargs would be overkill for a JSON-out CLI.
@@ -355,6 +382,103 @@ export async function runDispatchCli(
       return 0;
     }
 
+    // -----------------------------------------------------------------------
+    // Pattern X (AISDLC-396) — in-session background Agent dispatch.
+    //
+    // Conductor (running in the slash command body) emits a manifest, claims
+    // it into inflight/, and ALSO writes a bg-agent-request/ file that the
+    // slash command body's Step 2.5 sweep picks up and converts into an
+    // actual `Agent` tool call. Filesystem coordination because plugin
+    // subagents can't use `Agent` directly (AISDLC-98).
+    // -----------------------------------------------------------------------
+
+    case 'dispatch-bg-agent': {
+      // Reads the manifest at `--manifest-path` and writes a synthetic
+      // bg-agent-request describing the dev dispatch. The slash command
+      // body's next-step sweep fires the `Agent` tool call from this.
+      const manifestPath = requireFlag(flags, 'manifest-path');
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as DispatchManifest;
+      // Concurrency cap — Conductor MUST respect inSessionAgentMaxSessions.
+      // We re-check here as a defense-in-depth measure even though the
+      // Conductor's Step 5 also gates on `peek` before calling us.
+      //
+      // AISDLC-396 round-2 MAJOR-3 fix — cap precedence:
+      //   1. Explicit `--max-sessions <n>` flag wins (operator override or
+      //      slash command body passing the resolved cap forward).
+      //   2. Fall back to `spec.parallelism.inSessionAgentMaxSessions` from
+      //      `<workDir>/.ai-sdlc/dispatch-config.yaml` (where workDir is
+      //      derived from `--work-dir` flag OR the boardDir's parent's parent —
+      //      .ai-sdlc/dispatch/ → .ai-sdlc/ → workDir).
+      //   3. Final fallback: DEFAULT_IN_SESSION_AGENT_MAX_SESSIONS (4).
+      // Previously the yaml field was non-functional: the CLI always used 4
+      // and the operator's `inSessionAgentMaxSessions: 6` setting was silently
+      // ignored.
+      const yamlMaxSessions = resolveYamlInSessionAgentMaxSessions(flags, boardDir);
+      const fallback = yamlMaxSessions ?? DEFAULT_IN_SESSION_AGENT_MAX_SESSIONS;
+      const maxSessions = parseMaxSessions(flags, fallback);
+      const inFlight = countInFlightBgAgents(boardDir);
+      // Subtract the manifest we're about to dispatch FOR — it's already
+      // counted in inflight (the Conductor's Step 5 claims before calling
+      // us) so the comparison is against "other tasks already in flight".
+      const otherInFlight = Math.max(0, inFlight - 1);
+      if (otherInFlight >= maxSessions) {
+        out({
+          ok: false,
+          error: `dispatch-bg-agent: in-flight count ${otherInFlight} already meets cap ${maxSessions}; refuse to dispatch`,
+          inFlight: otherInFlight,
+          maxSessions,
+        });
+        return 1;
+      }
+      const writeOpts: { requestedAt?: string; requestedBy?: string } = {};
+      if (flags['requested-at']) writeOpts.requestedAt = flags['requested-at'];
+      if (flags['requested-by']) writeOpts.requestedBy = flags['requested-by'];
+      try {
+        const target = writeBgAgentRequest(boardDir, manifest, writeOpts);
+        out({ ok: true, path: target, taskId: manifest.taskId });
+        return 0;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        out({ ok: false, error: message });
+        return 1;
+      }
+    }
+
+    case 'list-bg-agent-requests': {
+      // The slash command body's Step 2.5 sweep enumerates pending
+      // requests with this. Returns oldest-first by requestedAt so the
+      // sweep fires dispatches in FIFO order.
+      const requests = listBgAgentRequests(boardDir);
+      out({ requests });
+      return 0;
+    }
+
+    case 'remove-bg-agent-request': {
+      // The slash command body's Step 2.5 sweep calls this after firing
+      // the Agent call (status moves implicitly: pending → fired → file
+      // removed when the dev verdict lands). Idempotent.
+      const taskId = requireFlag(flags, 'task-id');
+      removeBgAgentRequest(boardDir, taskId);
+      out({ ok: true });
+      return 0;
+    }
+
+    case 'prune-orphaned-bg-agent-requests': {
+      // Garbage-collect requests whose corresponding inflight manifest has
+      // been reaped by the stale-heartbeat sweeper. Safe to call every tick.
+      const pruned = pruneOrphanedBgAgentRequests(boardDir);
+      out({ pruned });
+      return 0;
+    }
+
+    case 'count-in-flight-bg-agents': {
+      // Conductor's Step 5 backpressure probe — returns the union count of
+      // pending requests + inflight manifests (deduplicated by taskId).
+      const count = countInFlightBgAgents(boardDir);
+      out({ count });
+      return 0;
+    }
+
     case '':
     case 'help':
     case '--help':
@@ -377,6 +501,57 @@ function requireFlag(flags: Record<string, string>, name: string): string {
     throw new Error(`cli-dispatch: --${name} is required`);
   }
   return v;
+}
+
+/**
+ * Parse the `--max-sessions` flag if present, else return the fallback.
+ * Validates the value is a non-negative integer; an unparseable value
+ * silently falls back so the Conductor isn't stranded on a typo.
+ */
+function parseMaxSessions(flags: Record<string, string>, fallback: number): number {
+  const raw = flags['max-sessions'];
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
+/**
+ * Resolve the yaml `spec.parallelism.inSessionAgentMaxSessions` knob
+ * (AISDLC-396 round-2 MAJOR-3 fix). Returns `undefined` when the yaml is
+ * missing, the field is absent, OR the value is non-numeric — callers
+ * fall through to {@link DEFAULT_IN_SESSION_AGENT_MAX_SESSIONS}.
+ *
+ * The workDir is derived from `--work-dir <path>` if supplied, otherwise
+ * inferred from `boardDir`:
+ *   - boardDir = `<workDir>/.ai-sdlc/dispatch` → workDir = `<two parents up>`
+ *   - boardDir = `<workDir>/.ai-sdlc/dispatch/` → same
+ *   - bespoke boardDir paths (test fixtures pointing at /tmp/...) → workDir
+ *     defaults to the boardDir's grandparent if it looks like an `.ai-sdlc`
+ *     parent; else we can't locate the yaml and return undefined.
+ *
+ * Tests can pass `--work-dir <tmp>` explicitly to drive the yaml load.
+ */
+function resolveYamlInSessionAgentMaxSessions(
+  flags: Record<string, string>,
+  boardDir: string,
+): number | undefined {
+  const explicit = flags['work-dir'];
+  let workDir: string | undefined = explicit ? path.resolve(explicit) : undefined;
+  if (!workDir) {
+    // boardDir naming convention: <workDir>/.ai-sdlc/dispatch
+    // → two `..` hops up. If boardDir doesn't match, we leave workDir
+    // undefined and skip the yaml load (test fixtures often supply ad-hoc
+    // tmp dirs that aren't structured as <workDir>/.ai-sdlc/dispatch).
+    const parent = path.dirname(boardDir); // .ai-sdlc
+    const grandparent = path.dirname(parent); // workDir
+    if (path.basename(parent) === '.ai-sdlc') {
+      workDir = grandparent;
+    }
+  }
+  if (!workDir) return undefined;
+  const cfg = loadDispatchConfig(workDir);
+  return cfg?.inSessionAgentMaxSessions;
 }
 
 const HELP_TEXT = `cli-dispatch — Dispatch Board operator CLI (RFC-0041 §4.4)
@@ -407,4 +582,12 @@ Phase 1.5 (RFC-0041 OQ-4 / AISDLC-377.2) — iteration mechanism:
   write-iteration-exhausted --task-id <id>
                             --iterations-attempted <n> --iteration-budget <n>
                             [--worker-id <s>] [--worker-kind <kind>] [--notes <s>]
+
+Pattern X (AISDLC-396) — in-session background Agent dispatch:
+  dispatch-bg-agent --manifest-path <path> [--max-sessions <n>]
+                    [--requested-at <iso>] [--requested-by <s>]
+  list-bg-agent-requests
+  remove-bg-agent-request --task-id <id>
+  prune-orphaned-bg-agent-requests
+  count-in-flight-bg-agents
 `;

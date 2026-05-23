@@ -600,4 +600,386 @@ describe('runDispatchCli', () => {
       expect(verdict.sessionId).toBe('abc-uuid');
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Pattern X (AISDLC-396) — bg-agent-request coordination subcommands
+  // -------------------------------------------------------------------------
+
+  describe('dispatch-bg-agent / list-bg-agent-requests / remove-bg-agent-request', () => {
+    /**
+     * Write a manifest to inflight/ directly (skipping the claim/queue
+     * dance) — Pattern X tests want a pre-claimed manifest to dispatch
+     * against without exercising the dispatch-board atomic-claim path.
+     */
+    function writeManifestToInflight(taskId: string): string {
+      const manifest = mkManifest(taskId);
+      const inflightDir = path.join(boardDir, 'inflight');
+      const target = path.join(inflightDir, `${taskId}.dispatch.json`);
+      writeFileSync(target, JSON.stringify(manifest, null, 2), 'utf-8');
+      return target;
+    }
+
+    it('writes a bg-agent-request to bg-agent-request/<task>.request.json', async () => {
+      const manifestPath = writeManifestToInflight('AISDLC-5000');
+      const { exit, captured } = await captureStdout(() =>
+        runDispatchCli([
+          'dispatch-bg-agent',
+          '--board-dir',
+          boardDir,
+          '--manifest-path',
+          manifestPath,
+          '--requested-at',
+          '2026-05-22T10:00:00.000Z',
+          '--requested-by',
+          'conductor-test',
+        ]),
+      );
+      expect(exit).toBe(0);
+      const result = readLastJson(captured) as { ok: boolean; path: string; taskId: string };
+      expect(result.ok).toBe(true);
+      expect(result.taskId).toBe('AISDLC-5000');
+      expect(result.path).toMatch(/bg-agent-request[/\\]AISDLC-5000\.request\.json$/);
+      const request = JSON.parse(readFileSync(result.path, 'utf-8'));
+      expect(request.schemaVersion).toBe('v1');
+      expect(request.taskId).toBe('AISDLC-5000');
+      expect(request.subagentType).toBe('developer');
+      expect(request.worktree).toBe('.worktrees/aisdlc-5000');
+      expect(request.requestedBy).toBe('conductor-test');
+      expect(request.requestedAt).toBe('2026-05-22T10:00:00.000Z');
+      expect(request.status).toBe('pending');
+      expect(typeof request.prompt).toBe('string');
+      expect(request.prompt).toMatch(/AISDLC-5000/);
+    });
+
+    it('refuses when the in-flight cap is already saturated (AC-5)', async () => {
+      // Pre-populate inflight/ with 4 manifests (the default cap).
+      writeManifestToInflight('AISDLC-5100');
+      writeManifestToInflight('AISDLC-5101');
+      writeManifestToInflight('AISDLC-5102');
+      writeManifestToInflight('AISDLC-5103');
+      // The 5th task — its manifest is the one we'd be dispatching for.
+      // Conductor wrote it to inflight/ before calling dispatch-bg-agent.
+      const manifestPath = writeManifestToInflight('AISDLC-5104');
+      // 5 in inflight; cap = 4; subtracting the current task gives 4 OTHER
+      // in-flight, which is >= cap → refuse.
+      const { exit, captured } = await captureStdout(() =>
+        runDispatchCli([
+          'dispatch-bg-agent',
+          '--board-dir',
+          boardDir,
+          '--manifest-path',
+          manifestPath,
+          '--max-sessions',
+          '4',
+        ]),
+      );
+      expect(exit).toBe(1);
+      const result = readLastJson(captured) as {
+        ok: boolean;
+        error: string;
+        inFlight: number;
+        maxSessions: number;
+      };
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/in-flight count .* already meets cap/);
+      expect(result.inFlight).toBe(4);
+      expect(result.maxSessions).toBe(4);
+    });
+
+    it('honors --max-sessions to override the default cap', async () => {
+      writeManifestToInflight('AISDLC-5200');
+      writeManifestToInflight('AISDLC-5201');
+      const manifestPath = writeManifestToInflight('AISDLC-5202');
+      // 3 in inflight, cap = 1 → 2 other in-flight >= 1 → refuse.
+      const { exit } = await captureStdout(() =>
+        runDispatchCli([
+          'dispatch-bg-agent',
+          '--board-dir',
+          boardDir,
+          '--manifest-path',
+          manifestPath,
+          '--max-sessions',
+          '1',
+        ]),
+      );
+      expect(exit).toBe(1);
+    });
+
+    it('refuses duplicate request when one already exists for the task', async () => {
+      const manifestPath = writeManifestToInflight('AISDLC-5300');
+      await runDispatchCli([
+        'dispatch-bg-agent',
+        '--board-dir',
+        boardDir,
+        '--manifest-path',
+        manifestPath,
+      ]);
+      const { exit, captured } = await captureStdout(() =>
+        runDispatchCli([
+          'dispatch-bg-agent',
+          '--board-dir',
+          boardDir,
+          '--manifest-path',
+          manifestPath,
+        ]),
+      );
+      expect(exit).toBe(1);
+      const result = readLastJson(captured) as { ok: boolean; error: string };
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/already exists/);
+    });
+
+    it('list-bg-agent-requests returns oldest-first by requestedAt', async () => {
+      const m1 = writeManifestToInflight('AISDLC-5400');
+      const m2 = writeManifestToInflight('AISDLC-5401');
+      const m3 = writeManifestToInflight('AISDLC-5402');
+      await runDispatchCli([
+        'dispatch-bg-agent',
+        '--board-dir',
+        boardDir,
+        '--manifest-path',
+        m1,
+        '--requested-at',
+        '2026-05-22T10:00:00.000Z',
+      ]);
+      await runDispatchCli([
+        'dispatch-bg-agent',
+        '--board-dir',
+        boardDir,
+        '--manifest-path',
+        m2,
+        '--requested-at',
+        '2026-05-22T09:00:00.000Z',
+      ]);
+      await runDispatchCli([
+        'dispatch-bg-agent',
+        '--board-dir',
+        boardDir,
+        '--manifest-path',
+        m3,
+        '--requested-at',
+        '2026-05-22T11:00:00.000Z',
+      ]);
+      const { exit, captured } = await captureStdout(() =>
+        runDispatchCli(['list-bg-agent-requests', '--board-dir', boardDir]),
+      );
+      expect(exit).toBe(0);
+      const result = readLastJson(captured) as {
+        requests: Array<{ taskId: string; requestedAt: string }>;
+      };
+      expect(result.requests).toHaveLength(3);
+      expect(result.requests.map((r) => r.taskId)).toEqual([
+        'AISDLC-5401', // 09:00
+        'AISDLC-5400', // 10:00
+        'AISDLC-5402', // 11:00
+      ]);
+    });
+
+    it('remove-bg-agent-request is idempotent (AC-2 cleanup path)', async () => {
+      const manifestPath = writeManifestToInflight('AISDLC-5500');
+      await runDispatchCli([
+        'dispatch-bg-agent',
+        '--board-dir',
+        boardDir,
+        '--manifest-path',
+        manifestPath,
+      ]);
+      const requestFile = path.join(boardDir, 'bg-agent-request', 'AISDLC-5500.request.json');
+      expect(existsSync(requestFile)).toBe(true);
+      await runDispatchCli([
+        'remove-bg-agent-request',
+        '--board-dir',
+        boardDir,
+        '--task-id',
+        'AISDLC-5500',
+      ]);
+      expect(existsSync(requestFile)).toBe(false);
+      // Second call must be a clean no-op (file already gone).
+      const { exit } = await captureStdout(() =>
+        runDispatchCli([
+          'remove-bg-agent-request',
+          '--board-dir',
+          boardDir,
+          '--task-id',
+          'AISDLC-5500',
+        ]),
+      );
+      expect(exit).toBe(0);
+    });
+
+    it('count-in-flight-bg-agents dedupes when both inflight and request exist for same task', async () => {
+      const manifestPath = writeManifestToInflight('AISDLC-5600');
+      writeManifestToInflight('AISDLC-5601');
+      await runDispatchCli([
+        'dispatch-bg-agent',
+        '--board-dir',
+        boardDir,
+        '--manifest-path',
+        manifestPath,
+      ]);
+      // AISDLC-5600 has BOTH inflight + request; AISDLC-5601 has only inflight.
+      // Dedup must give count = 2 (not 3).
+      const { captured } = await captureStdout(() =>
+        runDispatchCli(['count-in-flight-bg-agents', '--board-dir', boardDir]),
+      );
+      const result = readLastJson(captured) as { count: number };
+      expect(result.count).toBe(2);
+    });
+
+    it('prune-orphaned-bg-agent-requests removes requests whose inflight manifest is gone (AC-6 reaper safety)', async () => {
+      const manifestPath = writeManifestToInflight('AISDLC-5700');
+      writeManifestToInflight('AISDLC-5701');
+      await runDispatchCli([
+        'dispatch-bg-agent',
+        '--board-dir',
+        boardDir,
+        '--manifest-path',
+        manifestPath,
+      ]);
+      const m2Path = path.join(boardDir, 'inflight', 'AISDLC-5701.dispatch.json');
+      // Simulate writing a second request, then the stale-heartbeat sweeper
+      // reaping AISDLC-5701's manifest to failed/ (we just delete it here).
+      await runDispatchCli([
+        'dispatch-bg-agent',
+        '--board-dir',
+        boardDir,
+        '--manifest-path',
+        m2Path,
+      ]);
+      rmSync(m2Path);
+      const { exit, captured } = await captureStdout(() =>
+        runDispatchCli(['prune-orphaned-bg-agent-requests', '--board-dir', boardDir]),
+      );
+      expect(exit).toBe(0);
+      const result = readLastJson(captured) as { pruned: string[] };
+      expect(result.pruned).toEqual(['AISDLC-5701']);
+      // The healthy request for AISDLC-5700 is preserved.
+      expect(existsSync(path.join(boardDir, 'bg-agent-request', 'AISDLC-5700.request.json'))).toBe(
+        true,
+      );
+    });
+
+    it('honors yaml inSessionAgentMaxSessions as the max-sessions fallback (AC-5)', async () => {
+      // AISDLC-396 round-2 MAJOR-3 fix: when the operator sets a custom
+      // inSessionAgentMaxSessions in dispatch-config.yaml, the CLI must
+      // default --max-sessions from that value (not unconditionally to 4).
+      // Build a workDir with .ai-sdlc/dispatch-config.yaml setting cap=2
+      // and .ai-sdlc/dispatch/ as the board dir under it.
+      const workDir = mkdtempSync(path.join(tmpdir(), 'workdir-yaml-'));
+      const aiSdlcDir = path.join(workDir, '.ai-sdlc');
+      const boardDirUnderWork = path.join(aiSdlcDir, 'dispatch');
+      dispatchEnsureBoardDirs(boardDirUnderWork);
+      writeFileSync(
+        path.join(aiSdlcDir, 'dispatch-config.yaml'),
+        `apiVersion: ai-sdlc.io/v1alpha1
+kind: DispatchConfig
+spec:
+  defaultWorkerKind: in-session-agent
+  parallelism:
+    inSessionAgentMaxSessions: 2
+`,
+        'utf8',
+      );
+      // Pre-populate inflight/ with 2 manifests — at cap=2 from yaml, the
+      // 3rd dispatch must be refused even though no --max-sessions was passed.
+      const manifestA = mkManifest('AISDLC-5800');
+      const manifestB = mkManifest('AISDLC-5801');
+      const manifestC = mkManifest('AISDLC-5802');
+      const writeInflight = (m: DispatchManifest): string => {
+        const target = path.join(boardDirUnderWork, 'inflight', `${m.taskId}.dispatch.json`);
+        writeFileSync(target, JSON.stringify(m, null, 2), 'utf-8');
+        return target;
+      };
+      writeInflight(manifestA);
+      writeInflight(manifestB);
+      const manifestPath = writeInflight(manifestC);
+      // 3 in inflight; subtract current → 2 OTHER; cap from yaml = 2 → refuse.
+      const { exit, captured } = await captureStdout(() =>
+        runDispatchCli([
+          'dispatch-bg-agent',
+          '--board-dir',
+          boardDirUnderWork,
+          '--manifest-path',
+          manifestPath,
+        ]),
+      );
+      expect(exit).toBe(1);
+      const result = readLastJson(captured) as { maxSessions: number };
+      expect(result.maxSessions).toBe(2);
+      rmSync(workDir, { recursive: true, force: true });
+    });
+
+    it('falls back to default cap=4 when yaml is missing AND --max-sessions not passed', async () => {
+      // Sanity check for the cap precedence: with no yaml + no flag, the
+      // CLI must use DEFAULT_IN_SESSION_AGENT_MAX_SESSIONS (4). Place 5
+      // manifests so the 5th dispatch trips the default cap.
+      writeManifestToInflight('AISDLC-5810');
+      writeManifestToInflight('AISDLC-5811');
+      writeManifestToInflight('AISDLC-5812');
+      writeManifestToInflight('AISDLC-5813');
+      const manifestPath = writeManifestToInflight('AISDLC-5814');
+      // 5 in inflight; subtract current → 4 OTHER; default cap = 4 → refuse.
+      const { exit, captured } = await captureStdout(() =>
+        runDispatchCli([
+          'dispatch-bg-agent',
+          '--board-dir',
+          boardDir,
+          '--manifest-path',
+          manifestPath,
+        ]),
+      );
+      expect(exit).toBe(1);
+      const result = readLastJson(captured) as { maxSessions: number };
+      expect(result.maxSessions).toBe(4);
+    });
+
+    it('explicit --max-sessions still overrides yaml (cap precedence: flag > yaml > default)', async () => {
+      // Build workDir with yaml cap=8 and pass --max-sessions=1 → flag wins.
+      const workDir = mkdtempSync(path.join(tmpdir(), 'workdir-precedence-'));
+      const aiSdlcDir = path.join(workDir, '.ai-sdlc');
+      const boardDirUnderWork = path.join(aiSdlcDir, 'dispatch');
+      dispatchEnsureBoardDirs(boardDirUnderWork);
+      writeFileSync(
+        path.join(aiSdlcDir, 'dispatch-config.yaml'),
+        `spec:
+  parallelism:
+    inSessionAgentMaxSessions: 8
+`,
+        'utf8',
+      );
+      const writeInflight = (taskId: string): string => {
+        const m = mkManifest(taskId);
+        const target = path.join(boardDirUnderWork, 'inflight', `${m.taskId}.dispatch.json`);
+        writeFileSync(target, JSON.stringify(m, null, 2), 'utf-8');
+        return target;
+      };
+      writeInflight('AISDLC-5820');
+      writeInflight('AISDLC-5821');
+      const manifestPath = writeInflight('AISDLC-5822');
+      // 3 in inflight; subtract current → 2 OTHER. With --max-sessions=1
+      // we refuse; if we'd respected yaml (8) we'd accept. Asserts flag-wins.
+      const { exit, captured } = await captureStdout(() =>
+        runDispatchCli([
+          'dispatch-bg-agent',
+          '--board-dir',
+          boardDirUnderWork,
+          '--manifest-path',
+          manifestPath,
+          '--max-sessions',
+          '1',
+        ]),
+      );
+      expect(exit).toBe(1);
+      const result = readLastJson(captured) as { maxSessions: number };
+      expect(result.maxSessions).toBe(1);
+      rmSync(workDir, { recursive: true, force: true });
+    });
+
+    it('help mentions Pattern X subcommands', async () => {
+      const { captured } = await captureStdout(() => runDispatchCli(['help']));
+      expect(captured.raw).toMatch(/dispatch-bg-agent/);
+      expect(captured.raw).toMatch(/list-bg-agent-requests/);
+      expect(captured.raw).toMatch(/Pattern X/);
+    });
+  });
 });
