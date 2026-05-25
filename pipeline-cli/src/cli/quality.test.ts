@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { runReportUpstream } from './quality.js';
+import { buildQualityCli, runReportUpstream, runSeverityWeights } from './quality.js';
 import { UpstreamReportError } from '../tui/analytics/upstream-reporter.js';
 import {
   FRAMEWORK_QUALITY_CAPTURES_FILE,
@@ -179,5 +179,166 @@ describe('runReportUpstream', () => {
         print: true,
       }),
     ).toThrow(UpstreamReportError);
+  });
+});
+
+// ── severity-weights (AISDLC-305 / Phase 4) ──────────────────────────
+
+describe('runSeverityWeights (OQ-2)', () => {
+  it('returns shipping defaults with no overrides + no YAML', () => {
+    const result = runSeverityWeights({ workDir: workdir });
+    expect(result.resolved).toEqual({
+      operatorTimeCost: 1.0,
+      frameworkRecurrence: 1.0,
+      blastRadius: 1.0,
+    });
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('applies CLI overrides on top of YAML', () => {
+    const dir = join(workdir, '.ai-sdlc');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'quality-monitoring.yaml'),
+      ['quality:', '  severity-weights:', '    operator-time-cost: 1.5'].join('\n'),
+    );
+    const result = runSeverityWeights({
+      workDir: workdir,
+      severityWeight: ['blast-radius=2.5'],
+    });
+    expect(result.resolved.operatorTimeCost).toBeCloseTo(1.5); // YAML
+    expect(result.resolved.blastRadius).toBeCloseTo(2.5); // CLI
+    expect(result.resolved.frameworkRecurrence).toBe(1.0); // default
+  });
+
+  it('surfaces a warning for malformed override (continues with rest)', () => {
+    const result = runSeverityWeights({
+      workDir: workdir,
+      severityWeight: ['blast-radius=2.0', 'unknown-axis=5'],
+    });
+    expect(result.resolved.blastRadius).toBeCloseTo(2.0);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toMatch(/unknown severity-weight axis/);
+  });
+});
+
+// ── CLI wrapper (yargs router) integration tests ──────────────────────
+// These exercise the `severity-weights` subcommand through `buildQualityCli()`
+// to cover the handler body (warnings stderr emit + JSON/text branches)
+// that the pure runSeverityWeights() tests don't reach.
+
+describe('cli-quality severity-weights subcommand', () => {
+  let savedArgv: string[];
+  let savedStdoutWrite: typeof process.stdout.write;
+  let savedStderrWrite: typeof process.stderr.write;
+  let stdoutChunks: string[];
+  let stderrChunks: string[];
+
+  beforeEach(() => {
+    savedArgv = process.argv;
+    savedStdoutWrite = process.stdout.write.bind(process.stdout);
+    savedStderrWrite = process.stderr.write.bind(process.stderr);
+    stdoutChunks = [];
+    stderrChunks = [];
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      stdoutChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      stderrChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return true;
+    }) as typeof process.stderr.write;
+  });
+
+  afterEach(() => {
+    process.argv = savedArgv;
+    process.stdout.write = savedStdoutWrite;
+    process.stderr.write = savedStderrWrite;
+  });
+
+  function setArgv(...args: string[]): void {
+    process.argv = ['node', 'cli-quality', ...args];
+  }
+
+  it('text format prints all three axes from defaults', async () => {
+    setArgv('severity-weights', '--work-dir', workdir);
+    await buildQualityCli().parseAsync();
+    const out = stdoutChunks.join('');
+    expect(out).toMatch(/operator-time-cost:\s+1/);
+    expect(out).toMatch(/framework-recurrence:\s+1/);
+    expect(out).toMatch(/blast-radius:\s+1/);
+  });
+
+  it('json format emits the resolved object', async () => {
+    setArgv('severity-weights', '--work-dir', workdir, '--format', 'json');
+    await buildQualityCli().parseAsync();
+    const out = stdoutChunks.join('').trim();
+    const parsed = JSON.parse(out);
+    expect(parsed.operatorTimeCost).toBe(1);
+    expect(parsed.frameworkRecurrence).toBe(1);
+    expect(parsed.blastRadius).toBe(1);
+  });
+
+  it('layers CLI --severity-weight overrides on top of YAML', async () => {
+    const dir = join(workdir, '.ai-sdlc');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'quality-monitoring.yaml'),
+      ['quality:', '  severity-weights:', '    operator-time-cost: 1.5'].join('\n'),
+    );
+    setArgv(
+      'severity-weights',
+      '--work-dir',
+      workdir,
+      '--severity-weight',
+      'blast-radius=2.5',
+      '--format',
+      'json',
+    );
+    await buildQualityCli().parseAsync();
+    const out = stdoutChunks.join('').trim();
+    const parsed = JSON.parse(out);
+    expect(parsed.operatorTimeCost).toBeCloseTo(1.5);
+    expect(parsed.blastRadius).toBeCloseTo(2.5);
+    expect(parsed.frameworkRecurrence).toBe(1);
+  });
+
+  it('emits warnings on stderr for unknown axes (and continues with valid overrides)', async () => {
+    setArgv(
+      'severity-weights',
+      '--work-dir',
+      workdir,
+      '--severity-weight',
+      'blast-radius=2.0',
+      '--severity-weight',
+      'unknown-axis=5',
+      '--format',
+      'json',
+    );
+    await buildQualityCli().parseAsync();
+    const err = stderrChunks.join('');
+    expect(err).toMatch(/unknown severity-weight axis/);
+    const out = stdoutChunks.join('').trim();
+    const parsed = JSON.parse(out);
+    expect(parsed.blastRadius).toBeCloseTo(2.0);
+  });
+
+  it('accepts repeated --severity-weight flags for multiple axes', async () => {
+    setArgv(
+      'severity-weights',
+      '--work-dir',
+      workdir,
+      '--severity-weight',
+      'operator-time-cost=2.0',
+      '--severity-weight',
+      'blast-radius=3.0',
+      '--format',
+      'json',
+    );
+    await buildQualityCli().parseAsync();
+    const out = stdoutChunks.join('').trim();
+    const parsed = JSON.parse(out);
+    expect(parsed.operatorTimeCost).toBeCloseTo(2.0);
+    expect(parsed.blastRadius).toBeCloseTo(3.0);
   });
 });
