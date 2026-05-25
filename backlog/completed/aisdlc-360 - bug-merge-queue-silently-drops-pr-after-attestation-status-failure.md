@@ -1,8 +1,11 @@
 ---
 id: AISDLC-360
-title: 'bug(orchestrator): merge queue silently drops PR after queue probe ai-sdlc/attestation status FAILURE — needs auto-rebase-and-resign'
+title: >-
+  bug(orchestrator): merge queue silently drops PR after queue probe
+  ai-sdlc/attestation status FAILURE — needs auto-rebase-and-resign
 status: Done
-assignee: ['@claude']
+assignee:
+  - '@claude'
 created_date: '2026-05-17'
 completed_date: '2026-05-22'
 labels:
@@ -14,11 +17,18 @@ labels:
 dependencies:
   - AISDLC-343
 priority: critical
+blocked:
+  reason: "Task already completed 2026-05-22; cleanup edit by AISDLC-383.7 — DoR upstream-OQ re-evaluation on RFC-0035 lifecycle is not applicable to a shipped task."
 references:
   - .github/workflows/verify-attestation.yml
   - ai-sdlc-plugin/scripts/sign-attestation.mjs
   - orchestrator/src/runtime/attestations.ts
-  - docs/operations/merge-queue-rebase-recovery.md
+drift_log:
+  - date: '2026-05-25'
+    type: ref-deleted
+    detail: 'Referenced file removed by AISDLC-383.7 sub-attestation gate cleanup'
+    resolution: ref-stripped
+drift_checked: '2026-05-25'
 ---
 
 ## Bug
@@ -100,4 +110,4 @@ Rate: ~30% of multi-hour-lived PRs hit this. With shorter PR cycles + AISDLC-343
 
 Operator-away session 2026-05-17. The autonomous loop burned ~6 cycles trying to land 521 alone before this task was filed. Operator's explicit directive: "if pipeline experiences issues then open an issue for them and process it then get back to processing issues through the pipeline."
 
-The auto-rebase-and-resign workflow IS the "process it" step that closes the loop — once it ships, the operator-away loop becomes truly self-healing for this failure mode.
+The auto-rebase-and-resign workflow IS the "process it" step that closes the loop — once AISDLC-420 lands, the operator-away loop becomes truly self-healing for this failure mode.
