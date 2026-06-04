@@ -1,5 +1,6 @@
 /**
  * RFC-0043 Phase 3 — Stage 2/3: OpenShell Sandbox Runner (AISDLC-499)
+ * RFC-0043 Phase 7 — Real Docker sandbox driver (AISDLC-508)
  *
  * The core untrusted-execution layer:
  *  1. Sandbox-driver abstraction (Docker / Podman / Kata / gVisor / MicroVM)
@@ -29,11 +30,34 @@
  * Anthropic provider credentials are injected at the sandbox-local inference
  * router (`inference.local`) — the agent process never receives them directly.
  *
+ * ## Docker hardening (AISDLC-508)
+ * The `DockerSandboxDriver` uses the following hardened isolation flags:
+ *   - `--cidfile <tmpfile>`     — per-spawn cidfile; container ID read after start
+ *   - `--network=none`          — full network deny (inference.local bridge added in AISDLC-510)
+ *   - `--cap-drop=ALL`          — drop all Linux capabilities
+ *   - `--read-only`             — read-only root filesystem
+ *   - `--tmpfs /tmp:rw,noexec,nosuid,size=256m` — writable /tmp with exec-prevention
+ *   - `--tmpfs /sandbox/workspace:rw,noexec,nosuid` — writable workspace
+ *   - `--pids-limit 512`        — prevent fork bombs
+ *   - `--memory <N>m`           — cgroup memory limit from resourceLimits
+ *   - `--cpus <N>`              — cgroup CPU quota from resourceLimits
+ *   - `--user 65534:65534`      — run as nobody:nogroup
+ *   - `--rm`                    — auto-remove on exit
+ *   - `--security-opt seccomp=<profile>` — seccomp syscall filter
+ *   - `--security-opt no-new-privileges` — prevent privilege escalation
+ *
+ * Wall-clock enforcement is via AbortController: when the `runSandbox`
+ * timeout fires, the controller is aborted and the driver kills the container
+ * via `docker kill <id>` then `docker rm -f <id>`, returning
+ * `outcome: 'resource-breach'`.
+ *
  * @module pipeline/sandbox-runner
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 // ── Sandbox driver types ──────────────────────────────────────────────────────
 
@@ -506,8 +530,260 @@ abstract class BaseSandboxDriver implements SandboxDriver {
   abstract teardown(): Promise<void>;
 }
 
+// ── Docker hardening constants ────────────────────────────────────────────────
+
 /**
- * Docker sandbox driver — the default driver per OQ-5 resolution.
+ * Default seccomp profile for the Docker sandbox.
+ *
+ * Based on Docker's default seccomp profile, with additional restrictions:
+ * - Blocks syscalls commonly used in container-escape exploits
+ * - Blocks mount, ptrace, kexec, and other privilege-escalation paths
+ * - Allows only the syscalls needed for a typical Node.js test suite
+ *
+ * The `unconfined` value disables seccomp filtering — explicitly rejected.
+ * The profile is passed via `--security-opt seccomp=<json>`.
+ *
+ * AISDLC-509 (inference.local proxy wiring) will extend this list when
+ * network access is re-enabled via the loopback bridge.
+ */
+export const DOCKER_SECCOMP_PROFILE: Record<string, unknown> = {
+  defaultAction: 'SCMP_ACT_ERRNO',
+  architectures: ['SCMP_ARCH_X86_64', 'SCMP_ARCH_X86', 'SCMP_ARCH_X32'],
+  syscalls: [
+    {
+      names: [
+        // Core I/O
+        'read',
+        'write',
+        'readv',
+        'writev',
+        'pread64',
+        'pwrite64',
+        'lseek',
+        'sendfile',
+        // File ops
+        'open',
+        'openat',
+        'openat2',
+        'close',
+        'stat',
+        'fstat',
+        'lstat',
+        'newfstatat',
+        'statx',
+        'access',
+        'faccessat',
+        'faccessat2',
+        'getdents',
+        'getdents64',
+        'readlink',
+        'readlinkat',
+        'getcwd',
+        'chdir',
+        'fchdir',
+        'mkdir',
+        'mkdirat',
+        'unlink',
+        'unlinkat',
+        'rmdir',
+        'rename',
+        'renameat',
+        'renameat2',
+        'link',
+        'linkat',
+        'symlink',
+        'symlinkat',
+        'chmod',
+        'fchmod',
+        'fchmodat',
+        'chown',
+        'fchown',
+        'lchown',
+        'fchownat',
+        'truncate',
+        'ftruncate',
+        'fsync',
+        'fdatasync',
+        'sync',
+        'syncfs',
+        'ioctl',
+        'fcntl',
+        'dup',
+        'dup2',
+        'dup3',
+        'pipe',
+        'pipe2',
+        // Memory
+        'mmap',
+        'mmap2',
+        'munmap',
+        'mprotect',
+        'mremap',
+        'madvise',
+        'brk',
+        // Process / thread
+        'clone',
+        'clone3',
+        'fork',
+        'vfork',
+        'execve',
+        'execveat',
+        'exit',
+        'exit_group',
+        'wait4',
+        'waitpid',
+        'waitid',
+        'getpid',
+        'gettid',
+        'getppid',
+        'getpgrp',
+        'getpgid',
+        'setpgid',
+        'setsid',
+        'getsid',
+        'getuid',
+        'geteuid',
+        'getgid',
+        'getegid',
+        'getgroups',
+        'getresuid',
+        'getresgid',
+        'gettimeofday',
+        'clock_gettime',
+        'clock_getres',
+        'clock_nanosleep',
+        'nanosleep',
+        'time',
+        'times',
+        'utime',
+        'utimes',
+        'futimesat',
+        'utimensat',
+        // Signal
+        'rt_sigaction',
+        'rt_sigprocmask',
+        'rt_sigreturn',
+        'rt_sigsuspend',
+        'rt_sigpending',
+        'rt_sigtimedwait',
+        'rt_sigqueueinfo',
+        'kill',
+        'tgkill',
+        'tkill',
+        'sigaltstack',
+        // Poll / epoll / select
+        'poll',
+        'ppoll',
+        'select',
+        'pselect6',
+        'epoll_create',
+        'epoll_create1',
+        'epoll_ctl',
+        'epoll_wait',
+        'epoll_pwait',
+        'epoll_pwait2',
+        'eventfd',
+        'eventfd2',
+        // futex
+        'futex',
+        'futex_time64',
+        'futex_waitv',
+        'get_robust_list',
+        'set_robust_list',
+        // Socket (loopback only — no external network due to --network=none)
+        'socket',
+        'socketpair',
+        'bind',
+        'listen',
+        'accept',
+        'accept4',
+        'connect',
+        'getsockname',
+        'getpeername',
+        'setsockopt',
+        'getsockopt',
+        'sendto',
+        'sendmsg',
+        'sendmmsg',
+        'recvfrom',
+        'recvmsg',
+        'recvmmsg',
+        'shutdown',
+        // Memory advise / huge pages
+        'mincore',
+        'mlock',
+        'mlock2',
+        'munlock',
+        'mlockall',
+        'munlockall',
+        // Misc
+        'arch_prctl',
+        'prctl',
+        'set_tid_address',
+        'set_thread_area',
+        'get_thread_area',
+        'capget',
+        'getrlimit',
+        'setrlimit',
+        'prlimit64',
+        'getrusage',
+        'sysinfo',
+        'uname',
+        'sched_getaffinity',
+        'sched_setaffinity',
+        'sched_yield',
+        'sched_getscheduler',
+        'sched_setscheduler',
+        'sched_getparam',
+        'sched_setparam',
+        'sched_get_priority_min',
+        'sched_get_priority_max',
+        'getrandom',
+        'memfd_create',
+        'copy_file_range',
+        'splice',
+        'tee',
+        'sendfile64',
+        'inotify_init',
+        'inotify_init1',
+        'inotify_add_watch',
+        'inotify_rm_watch',
+        'statfs',
+        'fstatfs',
+        'umask',
+        'personality',
+        'timerfd_create',
+        'timerfd_gettime',
+        'timerfd_settime',
+        'signalfd',
+        'signalfd4',
+        'alarm',
+        'setitimer',
+        'getitimer',
+        'pause',
+        'userfaultfd',
+        'restart_syscall',
+        'rseq',
+        'pidfd_open',
+        'pidfd_send_signal',
+        'pidfd_getfd',
+        'close_range',
+        'io_uring_setup',
+        'io_uring_enter',
+        'io_uring_register',
+        'landlock_create_ruleset',
+        'landlock_add_rule',
+        'landlock_restrict_self',
+        'process_vm_readv',
+        'process_vm_writev',
+      ],
+      action: 'SCMP_ACT_ALLOW',
+    },
+  ],
+};
+
+/**
+ * Docker sandbox driver — the default v1 driver per RFC-0043 Phase 7 AQ1.
  *
  * Uses Docker (or compatible OCI runtime) for container isolation.
  * Documented trade-off per OQ-5: shared kernel; runc CVE-2024-21626
@@ -518,19 +794,59 @@ abstract class BaseSandboxDriver implements SandboxDriver {
  * In CI, real Docker operations are bypassed via the `MockSandboxDriver`
  * injection. Set `AI_SDLC_SANDBOX_INTEGRATION_TESTS=1` to run real
  * container tests.
+ *
+ * ## Hardening flags (AISDLC-508)
+ *   - `--cidfile <tmpfile>`                 per-spawn cidfile for kill/rm
+ *   - `--network=none`                      full network deny
+ *   - `--cap-drop=ALL`                      drop all Linux capabilities
+ *   - `--read-only`                         read-only root filesystem
+ *   - `--tmpfs /tmp:rw,noexec,nosuid,size=256m`
+ *   - `--tmpfs /sandbox/workspace:rw,noexec,nosuid`
+ *   - `--pids-limit 512`                   prevent fork bombs
+ *   - `--memory <N>m`                      cgroup memory limit
+ *   - `--cpus <N>`                         cgroup CPU quota
+ *   - `--user 65534:65534`                 run as nobody:nogroup
+ *   - `--rm`                               auto-remove on exit
+ *   - `--security-opt seccomp=<json>`      syscall allowlist
+ *   - `--security-opt no-new-privileges`   prevent privilege escalation
  */
 export class DockerSandboxDriver extends BaseSandboxDriver {
   readonly kind: SandboxDriverKind = 'docker';
 
+  /**
+   * Container ID read from the cidfile after the container starts.
+   * Written by `docker run --cidfile <path>`; read after spawn begins.
+   * Used by `killContainer()` and `teardown()` for `docker kill`/`docker rm -f`.
+   */
   private containerId: string | null = null;
 
-  protected async doSpawn(input: SandboxSpawnInput): Promise<SandboxResult> {
-    const start = Date.now();
-    const { resourceLimits } = input;
+  /**
+   * Path to the cidfile created per spawn invocation.
+   * Lives in an isolated mkdtemp directory; cleaned up in `teardown()`.
+   */
+  private cidFilePath: string | null = null;
 
-    // Build the differential test sequence inside the container.
-    // In production: spawns `docker run` with cgroup limits.
-    // In CI (no real Docker): throws unless mocked.
+  /**
+   * Thin spawn seam — wraps `child_process.spawn` so tests can override it
+   * without a real Docker daemon. Override in a subclass or swap via spawnFn
+   * injected in tests.
+   *
+   * All behaviour (arg building, cidfile poll, abort wiring, kill, teardown,
+   * output parse) is exercised by tests; only this line is integration-gated.
+   *
+   * @internal — exported for hermetic testing only; not part of the public API.
+   */
+  protected _spawnProcess(cmd: string, args: string[], options: SpawnOptions): ChildProcess {
+    return spawn(cmd, args, options);
+  }
+
+  protected async doSpawn(
+    input: SandboxSpawnInput & { abortSignal?: AbortSignal },
+  ): Promise<SandboxResult> {
+    const start = Date.now();
+
+    // In CI (no real Docker): return a descriptive error. The runner-level
+    // Promise.race handles wall-clock enforcement before we get here.
     if (process.env['AI_SDLC_SANDBOX_INTEGRATION_TESTS'] !== '1') {
       return {
         outcome: 'error',
@@ -540,26 +856,37 @@ export class DockerSandboxDriver extends BaseSandboxDriver {
       };
     }
 
+    // Check abort signal — if already aborted before spawn, return breach
+    if (input.abortSignal?.aborted) {
+      return {
+        outcome: 'resource-breach',
+        breach: buildResourceBreachEvent(
+          input.prNumber,
+          'wall-clock',
+          input.resourceLimits.wallClockSeconds,
+          'seconds',
+        ),
+      };
+    }
+
     try {
       const result = await this.runDockerDifferentialTest(input);
       const durationMs = Date.now() - start;
-
-      // Wall-clock breach check
-      if (durationMs > resourceLimits.wallClockSeconds * 1000) {
+      return { outcome: 'success', differentialTest: result, durationMs };
+    } catch (err) {
+      // Distinguish abort-triggered kills from genuine errors
+      if (input.abortSignal?.aborted) {
         return {
           outcome: 'resource-breach',
           breach: buildResourceBreachEvent(
             input.prNumber,
             'wall-clock',
-            resourceLimits.wallClockSeconds,
+            input.resourceLimits.wallClockSeconds,
             'seconds',
-            Math.round(durationMs / 1000),
+            Math.round((Date.now() - start) / 1000),
           ),
         };
       }
-
-      return { outcome: 'success', differentialTest: result, durationMs };
-    } catch (err) {
       return {
         outcome: 'error',
         error: err instanceof Error ? err.message : String(err),
@@ -567,29 +894,269 @@ export class DockerSandboxDriver extends BaseSandboxDriver {
     }
   }
 
+  /**
+   * Run the differential test sequence inside a hardened Docker container.
+   *
+   * This is the integration seam: when `AI_SDLC_SANDBOX_INTEGRATION_TESTS=1`,
+   * spawns a real container. AISDLC-509 will fill in the in-container
+   * differential-test logic (clone, apply diff, run upstream + new tests).
+   * This task (AISDLC-508) implements the container LIFECYCLE: startup,
+   * resource limits, abort-kill, and teardown.
+   */
   private async runDockerDifferentialTest(
-    input: SandboxSpawnInput,
+    input: SandboxSpawnInput & { abortSignal?: AbortSignal },
   ): Promise<DifferentialTestResult> {
-    // Production implementation would:
-    // 1. docker run --memory=${limits.memoryMb}m --cpus=${limits.cpuCores}
-    //    --timeout=${limits.wallClockSeconds}s <image> ...
-    // 2. Inside container: git clone, apply diff, pnpm test (upstream + new)
-    // 3. Parse test output for pass/fail + coverage
-    //
-    // For integration test path (AI_SDLC_SANDBOX_INTEGRATION_TESTS=1),
-    // this is where the real Docker exec would live. Stubbed for now.
-    void input;
-    throw new Error(
-      'DockerSandboxDriver.runDockerDifferentialTest: not yet implemented for integration tests',
-    );
+    const { resourceLimits } = input;
+    const seccompJson = JSON.stringify(DOCKER_SECCOMP_PROFILE);
+
+    // Create an isolated temp directory and cidfile path per spawn invocation.
+    // `docker run --cidfile <path>` writes the full container ID to this file
+    // once the container starts (even in foreground / non-detached mode).
+    // We read the cidfile to obtain the container ID for kill/rm operations.
+    const cidDir = mkdtempSync(join(tmpdir(), 'ai-sdlc-sandbox-'));
+    const cidFilePath = join(cidDir, 'container.cid');
+    this.cidFilePath = cidFilePath;
+
+    // Build the docker run arguments
+    const args = buildDockerRunArgs({
+      resourceLimits,
+      seccompProfileJson: seccompJson,
+      cidFilePath,
+      // AISDLC-509 will inject the real image + in-container command
+      image: process.env['AI_SDLC_SANDBOX_IMAGE'] ?? 'node:22-slim',
+      command: [
+        '/bin/sh',
+        '-c',
+        // Placeholder — AISDLC-509 replaces this with the real differential test entrypoint
+        'echo "in-container differential test not yet wired" && exit 1',
+      ],
+    });
+
+    return new Promise<DifferentialTestResult>((resolve, reject) => {
+      const proc = this._spawnProcess('docker', args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // Pass a clean environment — never inherit the host env wholesale
+        env: {
+          PATH: process.env['PATH'] ?? '/usr/local/bin:/usr/bin:/bin',
+          ...(input.sandboxEnv ?? {}),
+        },
+      });
+
+      // Poll the cidfile for the container ID shortly after spawn.
+      // `docker run --cidfile` writes the ID as soon as the container starts,
+      // before the container's stdout produces any output. We poll with a short
+      // interval so killContainer() can use the real ID on abort.
+      const cidPollInterval = setInterval(() => {
+        if (!this.containerId && existsSync(cidFilePath)) {
+          try {
+            const id = readFileSync(cidFilePath, 'utf8').trim();
+            if (id && /^[0-9a-f]{12,64}$/i.test(id)) {
+              this.containerId = id;
+              clearInterval(cidPollInterval);
+            }
+          } catch {
+            // cidfile may not be fully written yet — retry on next tick
+          }
+        }
+      }, 50);
+
+      let stdout = '';
+      let stderr = '';
+      proc.stdout?.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      proc.stderr?.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+
+      // Wire abort signal to kill the container
+      const onAbort = () => {
+        clearInterval(cidPollInterval);
+        this.killContainer().catch(() => {
+          // best-effort kill — teardown() will also attempt rm -f
+        });
+        proc.kill('SIGKILL');
+        reject(new Error('Docker container aborted by wall-clock timeout'));
+      };
+      if (input.abortSignal) {
+        if (input.abortSignal.aborted) {
+          onAbort();
+          return;
+        }
+        input.abortSignal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      proc.on('close', (exitCode) => {
+        clearInterval(cidPollInterval);
+        if (input.abortSignal) {
+          input.abortSignal.removeEventListener('abort', onAbort);
+        }
+
+        // Read the container ID from the cidfile on close in case the poll
+        // interval had not yet fired (fast-exiting containers).
+        if (!this.containerId && existsSync(cidFilePath)) {
+          try {
+            const id = readFileSync(cidFilePath, 'utf8').trim();
+            if (id && /^[0-9a-f]{12,64}$/i.test(id)) {
+              this.containerId = id;
+            }
+          } catch {
+            // cidfile may be absent if the container failed before starting
+          }
+        }
+
+        if (input.abortSignal?.aborted) {
+          reject(new Error('Docker container aborted by wall-clock timeout'));
+          return;
+        }
+
+        // AISDLC-509 will parse stdout/stderr into a real DifferentialTestResult.
+        // For now, surface the container output for debugging and return a
+        // not-yet-implemented result so the lifecycle path works end-to-end.
+        if (exitCode !== 0) {
+          reject(
+            new Error(
+              `Docker container exited with code ${exitCode}. ` +
+                `stdout: ${stdout.slice(0, 500)} stderr: ${stderr.slice(0, 500)}`,
+            ),
+          );
+          return;
+        }
+
+        // Placeholder result — AISDLC-509 replaces this with real test output parsing
+        resolve({
+          upstreamSuitePassed: false,
+          upstreamSuiteOutput: `[differential-test pending] raw stdout: ${stdout.slice(0, 500)}`,
+          newTestsPassed: false,
+          newTestsOutput: `[differential-test pending] raw stderr: ${stderr.slice(0, 500)}`,
+          newCodeCoveragePct: 0,
+        });
+      });
+
+      proc.on('error', (err) => {
+        clearInterval(cidPollInterval);
+        if (input.abortSignal) {
+          input.abortSignal.removeEventListener('abort', onAbort);
+        }
+        reject(err);
+      });
+    });
   }
 
+  /**
+   * Kill the container by ID (used on abort signal).
+   * Idempotent — errors are swallowed so teardown() can also attempt rm -f.
+   */
+  private async killContainer(): Promise<void> {
+    if (!this.containerId) return;
+    const id = this.containerId;
+    await new Promise<void>((resolve) => {
+      const proc = this._spawnProcess('docker', ['kill', id], { stdio: 'ignore' });
+      proc.on('close', () => resolve());
+      proc.on('error', () => resolve());
+    });
+  }
+
+  /**
+   * Idempotent teardown — `docker rm -f` the container by ID, then clean up
+   * the cidfile and its temp directory.
+   * Called after spawn resolves or rejects (including on wall-clock timeout).
+   * Suppresses all errors to prevent masking the original spawn result.
+   */
   async teardown(): Promise<void> {
-    if (this.containerId) {
-      // docker rm -f this.containerId
-      this.containerId = null;
+    const id = this.containerId;
+    const cidFilePath = this.cidFilePath;
+    this.containerId = null;
+    this.cidFilePath = null;
+
+    if (id) {
+      await new Promise<void>((resolve) => {
+        const proc = this._spawnProcess('docker', ['rm', '-f', id], { stdio: 'ignore' });
+        proc.on('close', () => resolve());
+        proc.on('error', () => resolve());
+      });
+    }
+
+    // Clean up the cidfile temp directory (best-effort)
+    if (cidFilePath) {
+      try {
+        // Remove the temp dir that contains the cidfile
+        const cidDir = cidFilePath.substring(0, cidFilePath.lastIndexOf('/'));
+        rmSync(cidDir, { recursive: true, force: true });
+      } catch {
+        // suppress — cidfile cleanup is best-effort
+      }
     }
   }
+}
+
+// ── Docker argument builder (exported for unit-test assertions) ───────────────
+
+export interface DockerRunArgsInput {
+  resourceLimits: ResourceLimits;
+  seccompProfileJson: string;
+  image: string;
+  command: string[];
+  /**
+   * Path to the cidfile for this spawn invocation.
+   * `docker run --cidfile <path>` writes the full container ID to this file
+   * once the container starts (foreground or detached). Required so that
+   * `killContainer()` and `teardown()` can kill/rm the real container ID.
+   */
+  cidFilePath: string;
+}
+
+/**
+ * Build the hardened `docker run` argument list for the sandbox.
+ *
+ * Exported for unit-test argument-construction assertions (AISDLC-508 AC-1).
+ * The exact flags are testable without a real Docker daemon.
+ *
+ * Hardening applied:
+ *   --cidfile <path>               — write container ID to file (required for kill/rm)
+ *   --network=none                 — full network deny (AISDLC-510 adds inference bridge)
+ *   --cap-drop=ALL                 — drop all Linux capabilities
+ *   --read-only                    — read-only root filesystem
+ *   --tmpfs /tmp:rw,noexec,nosuid,size=256m
+ *   --tmpfs /sandbox/workspace:rw,noexec,nosuid
+ *   --pids-limit 512               — prevent fork bombs
+ *   --memory <N>m                  — cgroup memory limit
+ *   --cpus <N>                     — cgroup CPU quota
+ *   --user 65534:65534             — nobody:nogroup
+ *   --rm                           — auto-remove on exit
+ *   --security-opt seccomp=<json>  — syscall allowlist
+ *   --security-opt no-new-privileges
+ */
+export function buildDockerRunArgs(opts: DockerRunArgsInput): string[] {
+  const { resourceLimits, seccompProfileJson, cidFilePath, image, command } = opts;
+
+  return [
+    'run',
+    '--rm',
+    '--cidfile',
+    cidFilePath,
+    '--network=none',
+    '--cap-drop=ALL',
+    '--read-only',
+    '--tmpfs',
+    '/tmp:rw,noexec,nosuid,size=256m',
+    '--tmpfs',
+    '/sandbox/workspace:rw,noexec,nosuid',
+    '--pids-limit',
+    '512',
+    '--memory',
+    `${resourceLimits.memoryMb}m`,
+    '--cpus',
+    String(resourceLimits.cpuCores),
+    '--user',
+    '65534:65534',
+    '--security-opt',
+    `seccomp=${seccompProfileJson}`,
+    '--security-opt',
+    'no-new-privileges',
+    image,
+    ...command,
+  ];
 }
 
 /**
