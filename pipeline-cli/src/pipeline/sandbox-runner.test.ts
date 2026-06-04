@@ -25,6 +25,7 @@ import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import {
   resolveEffectiveDriver,
   validateSandboxEnv,
+  validateUpstreamMainRef,
   buildResourceBreachEvent,
   buildResourceBreachComment,
   loadSandboxConfig,
@@ -43,6 +44,9 @@ import {
   MockSandboxDriver,
   buildDockerRunArgs,
   DOCKER_SECCOMP_PROFILE,
+  parseDifferentialTestOutput,
+  buildDifferentialTestScript,
+  DIFFERENTIAL_RESULT_SENTINEL,
   type SandboxConfig,
   type ResourceBreachEvent,
 } from './sandbox-runner.js';
@@ -1819,7 +1823,8 @@ function withIntegrationFlag(fn: () => Promise<void>): () => Promise<void> {
 const LIFECYCLE_INPUT = {
   policyFilePath: '/nonexistent',
   prDiff: 'diff --git a/foo.ts b/foo.ts\n+// new line\n',
-  upstreamMainRef: 'test',
+  // Use a valid https URL — 'test' is not a valid SHA or URL (would fail validateUpstreamMainRef)
+  upstreamMainRef: 'https://github.com/example/repo.git',
   resourceLimits: DEFAULT_RESOURCE_LIMITS,
   prNumber: 42,
 };
@@ -1908,12 +1913,13 @@ describe('DockerSandboxDriver — hermetic lifecycle via _spawnProcess seam', ()
   // ── successful exit path ───────────────────────────────────────────────────
 
   it(
-    'doSpawn: docker exits 0 → outcome:success with placeholder DifferentialTestResult',
+    'doSpawn: docker exits 0 with no sentinel → outcome:success with fail-closed result (garbage output)',
     withIntegrationFlag(async () => {
       const driver = new TestableDockerDriver((_cmd, args) => {
         const proc = new FakeProcess(args);
         setImmediate(() => {
-          proc.emitStdout('some stdout\n');
+          // No sentinel in output → parseDifferentialTestOutput returns failure
+          proc.emitStdout('some unstructured stdout\n');
           proc.emitClose(0);
         });
         return proc;
@@ -1923,10 +1929,47 @@ describe('DockerSandboxDriver — hermetic lifecycle via _spawnProcess seam', ()
 
       expect(result.outcome).toBe('success');
       if (result.outcome === 'success') {
-        // Placeholder result from AISDLC-508 (AISDLC-509 will replace with real parsing)
+        // Fail-closed: no sentinel → all false/0
         expect(result.differentialTest.upstreamSuitePassed).toBe(false);
         expect(result.differentialTest.newTestsPassed).toBe(false);
         expect(result.differentialTest.newCodeCoveragePct).toBe(0);
+        expect(result.durationMs).toBeGreaterThanOrEqual(0);
+      }
+    }),
+  );
+
+  it(
+    'doSpawn: docker exits 0 with valid sentinel + JSON → outcome:success with parsed result',
+    withIntegrationFlag(async () => {
+      const validOutput = [
+        'Running upstream tests...',
+        'All tests passed',
+        DIFFERENTIAL_RESULT_SENTINEL,
+        JSON.stringify({
+          upstreamPassed: true,
+          upstreamOutput: 'All 42 tests passed',
+          headPassed: true,
+          headOutput: 'Coverage: 88.5%',
+          coveragePct: 88.5,
+        }),
+      ].join('\n');
+
+      const driver = new TestableDockerDriver((_cmd, args) => {
+        const proc = new FakeProcess(args);
+        setImmediate(() => {
+          proc.emitStdout(validOutput);
+          proc.emitClose(0);
+        });
+        return proc;
+      });
+
+      const result = await driver.spawn(LIFECYCLE_INPUT as Parameters<typeof driver.spawn>[0]);
+
+      expect(result.outcome).toBe('success');
+      if (result.outcome === 'success') {
+        expect(result.differentialTest.upstreamSuitePassed).toBe(true);
+        expect(result.differentialTest.newTestsPassed).toBe(true);
+        expect(result.differentialTest.newCodeCoveragePct).toBe(88.5);
         expect(result.durationMs).toBeGreaterThanOrEqual(0);
       }
     }),
@@ -2459,6 +2502,975 @@ describe('DockerSandboxDriver — hermetic lifecycle via _spawnProcess seam', ()
       await driver.spawn(LIFECYCLE_INPUT as Parameters<typeof driver.spawn>[0]);
       // teardown should NOT throw even when docker rm -f fails
       await expect(driver.teardown()).resolves.toBeUndefined();
+    }),
+  );
+});
+
+// ── AISDLC-509: parseDifferentialTestOutput — fail-closed output parser ────────
+
+describe('parseDifferentialTestOutput (AISDLC-509 AC-4)', () => {
+  // Helper: build a valid output string with a sentinel + JSON result
+  function makeOutput(result: {
+    upstreamPassed: boolean;
+    upstreamOutput: string;
+    headPassed: boolean;
+    headOutput: string;
+    coveragePct: number;
+  }): string {
+    return `Some test output\n${DIFFERENTIAL_RESULT_SENTINEL}\n${JSON.stringify(result)}\n`;
+  }
+
+  it('DIFFERENTIAL_RESULT_SENTINEL is a non-empty string', () => {
+    expect(typeof DIFFERENTIAL_RESULT_SENTINEL).toBe('string');
+    expect(DIFFERENTIAL_RESULT_SENTINEL.length).toBeGreaterThan(0);
+  });
+
+  // ── Fail-closed cases ─────────────────────────────────────────────────────
+
+  it('empty stdout → fail-closed result', () => {
+    const result = parseDifferentialTestOutput('');
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(false);
+    expect(result.newCodeCoveragePct).toBe(0);
+  });
+
+  it('garbage/unstructured stdout → fail-closed result', () => {
+    const result = parseDifferentialTestOutput('some random output\nno sentinel here');
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(false);
+    expect(result.newCodeCoveragePct).toBe(0);
+  });
+
+  it('sentinel present but no JSON after it → fail-closed result', () => {
+    const result = parseDifferentialTestOutput(`${DIFFERENTIAL_RESULT_SENTINEL}\n`);
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(false);
+    expect(result.newCodeCoveragePct).toBe(0);
+  });
+
+  it('sentinel present but invalid JSON after it → fail-closed result', () => {
+    const result = parseDifferentialTestOutput(`${DIFFERENTIAL_RESULT_SENTINEL}\n{not valid json`);
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(false);
+    expect(result.newCodeCoveragePct).toBe(0);
+  });
+
+  it('sentinel present + JSON array (not object) → fail-closed result', () => {
+    const result = parseDifferentialTestOutput(`${DIFFERENTIAL_RESULT_SENTINEL}\n[1, 2, 3]`);
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(false);
+  });
+
+  it('sentinel present + JSON null → fail-closed result', () => {
+    const result = parseDifferentialTestOutput(`${DIFFERENTIAL_RESULT_SENTINEL}\nnull`);
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(false);
+  });
+
+  it('sentinel present + JSON with wrong field types → fail-closed result', () => {
+    // upstreamPassed should be boolean, not string
+    const result = parseDifferentialTestOutput(
+      `${DIFFERENTIAL_RESULT_SENTINEL}\n` +
+        JSON.stringify({
+          upstreamPassed: 'yes',
+          upstreamOutput: 'output',
+          headPassed: true,
+          headOutput: 'output',
+          coveragePct: 80,
+        }),
+    );
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(false);
+  });
+
+  it('sentinel present + JSON with missing fields → fail-closed result', () => {
+    const result = parseDifferentialTestOutput(
+      `${DIFFERENTIAL_RESULT_SENTINEL}\n` + JSON.stringify({ upstreamPassed: true }), // missing headPassed, coveragePct, etc.
+    );
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(false);
+    expect(result.newCodeCoveragePct).toBe(0);
+  });
+
+  it('sentinel present + JSON with NaN coveragePct → fail-closed result', () => {
+    // JSON.parse('{"coveragePct": NaN}') would fail since NaN is not valid JSON
+    // but we can test the guard by producing a coveragePct via constructor
+    const result = parseDifferentialTestOutput(
+      `${DIFFERENTIAL_RESULT_SENTINEL}\n` +
+        `{"upstreamPassed":true,"upstreamOutput":"","headPassed":true,"headOutput":"","coveragePct":null}`,
+    );
+    // null is not a number → fail-closed
+    expect(result.upstreamSuitePassed).toBe(false);
+  });
+
+  // ── Happy-path cases ─────────────────────────────────────────────────────
+
+  it('valid output: upstream pass + head pass + coverage → parsed correctly', () => {
+    const result = parseDifferentialTestOutput(
+      makeOutput({
+        upstreamPassed: true,
+        upstreamOutput: 'All 42 tests passed',
+        headPassed: true,
+        headOutput: 'All 47 tests passed',
+        coveragePct: 85.5,
+      }),
+    );
+    expect(result.upstreamSuitePassed).toBe(true);
+    expect(result.newTestsPassed).toBe(true);
+    expect(result.newCodeCoveragePct).toBe(85.5);
+    expect(result.upstreamSuiteOutput).toContain('All 42 tests passed');
+    expect(result.newTestsOutput).toContain('All 47 tests passed');
+  });
+
+  it('valid output: upstream fail + head pass → upstream failure preserved', () => {
+    const result = parseDifferentialTestOutput(
+      makeOutput({
+        upstreamPassed: false,
+        upstreamOutput: 'FAIL: 3 tests failed',
+        headPassed: true,
+        headOutput: 'All new tests passed',
+        coveragePct: 72.3,
+      }),
+    );
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(true);
+    expect(result.newCodeCoveragePct).toBe(72.3);
+  });
+
+  it('valid output: upstream pass + head fail → head failure preserved', () => {
+    const result = parseDifferentialTestOutput(
+      makeOutput({
+        upstreamPassed: true,
+        upstreamOutput: 'All tests passed',
+        headPassed: false,
+        headOutput: 'FAIL: new test assert failed',
+        coveragePct: 0,
+      }),
+    );
+    expect(result.upstreamSuitePassed).toBe(true);
+    expect(result.newTestsPassed).toBe(false);
+    expect(result.newCodeCoveragePct).toBe(0);
+  });
+
+  it('valid output: zero coverage → preserved as 0', () => {
+    const result = parseDifferentialTestOutput(
+      makeOutput({
+        upstreamPassed: true,
+        upstreamOutput: '',
+        headPassed: false,
+        headOutput: '',
+        coveragePct: 0,
+      }),
+    );
+    expect(result.newCodeCoveragePct).toBe(0);
+  });
+
+  it('valid output: coverage at exactly 100 → preserved', () => {
+    const result = parseDifferentialTestOutput(
+      makeOutput({
+        upstreamPassed: true,
+        upstreamOutput: '',
+        headPassed: true,
+        headOutput: '',
+        coveragePct: 100,
+      }),
+    );
+    expect(result.newCodeCoveragePct).toBe(100);
+  });
+
+  it('coverage > 100 → clamped to 100', () => {
+    const result = parseDifferentialTestOutput(
+      makeOutput({
+        upstreamPassed: true,
+        upstreamOutput: '',
+        headPassed: true,
+        headOutput: '',
+        coveragePct: 102.7,
+      }),
+    );
+    expect(result.newCodeCoveragePct).toBe(100);
+  });
+
+  it('coverage < 0 → clamped to 0', () => {
+    const result = parseDifferentialTestOutput(
+      makeOutput({
+        upstreamPassed: true,
+        upstreamOutput: '',
+        headPassed: true,
+        headOutput: '',
+        coveragePct: -5,
+      }),
+    );
+    expect(result.newCodeCoveragePct).toBe(0);
+  });
+
+  // ── LAST-sentinel wins (injection guard) ──────────────────────────────────
+
+  it('LAST sentinel wins: attacker plants early false-pass sentinel, real result is failure', () => {
+    // An attacker might try to inject an early "passing" result before the real
+    // sentinel. The parser uses the LAST sentinel occurrence — so the real
+    // result (failure) wins, not the attacker's injected pass.
+    const output = [
+      '# Injected early result:',
+      DIFFERENTIAL_RESULT_SENTINEL,
+      JSON.stringify({
+        upstreamPassed: true,
+        upstreamOutput: '',
+        headPassed: true,
+        headOutput: '',
+        coveragePct: 99,
+      }),
+      '# Real test run begins:',
+      'FAIL: upstream test 3 failed',
+      DIFFERENTIAL_RESULT_SENTINEL,
+      JSON.stringify({
+        upstreamPassed: false,
+        upstreamOutput: 'FAIL: test 3',
+        headPassed: false,
+        headOutput: '',
+        coveragePct: 0,
+      }),
+    ].join('\n');
+
+    const result = parseDifferentialTestOutput(output);
+    // LAST sentinel → real failure wins
+    expect(result.upstreamSuitePassed).toBe(false);
+    expect(result.newTestsPassed).toBe(false);
+  });
+
+  it('LAST sentinel wins: two passing results — last one is authoritative', () => {
+    const output = [
+      DIFFERENTIAL_RESULT_SENTINEL,
+      JSON.stringify({
+        upstreamPassed: false,
+        upstreamOutput: '',
+        headPassed: false,
+        headOutput: '',
+        coveragePct: 0,
+      }),
+      'Some more output',
+      DIFFERENTIAL_RESULT_SENTINEL,
+      JSON.stringify({
+        upstreamPassed: true,
+        upstreamOutput: 'pass',
+        headPassed: true,
+        headOutput: 'pass',
+        coveragePct: 80,
+      }),
+    ].join('\n');
+
+    const result = parseDifferentialTestOutput(output);
+    expect(result.upstreamSuitePassed).toBe(true);
+    expect(result.newTestsPassed).toBe(true);
+    expect(result.newCodeCoveragePct).toBe(80);
+  });
+
+  // ── Integration via TestableDockerDriver ──────────────────────────────────
+
+  it(
+    'TestableDockerDriver: valid sentinel output → parsed DifferentialTestResult',
+    withIntegrationFlag(async () => {
+      const validOutput = [
+        'Cloning repo...',
+        'Applying diff...',
+        'Running upstream tests...',
+        DIFFERENTIAL_RESULT_SENTINEL,
+        JSON.stringify({
+          upstreamPassed: true,
+          upstreamOutput: 'Tests: 100 passed',
+          headPassed: true,
+          headOutput: 'Tests: 105 passed, Coverage: 91.2%',
+          coveragePct: 91.2,
+        }),
+      ].join('\n');
+
+      const driver = new TestableDockerDriver((_cmd, args) => {
+        const proc = new FakeProcess(args);
+        setImmediate(() => {
+          proc.emitStdout(validOutput);
+          proc.emitClose(0);
+        });
+        return proc;
+      });
+
+      const result = await driver.spawn(LIFECYCLE_INPUT as Parameters<typeof driver.spawn>[0]);
+
+      expect(result.outcome).toBe('success');
+      if (result.outcome === 'success') {
+        expect(result.differentialTest.upstreamSuitePassed).toBe(true);
+        expect(result.differentialTest.newTestsPassed).toBe(true);
+        expect(result.differentialTest.newCodeCoveragePct).toBe(91.2);
+      }
+    }),
+  );
+
+  it(
+    'TestableDockerDriver: garbage output (no sentinel) → fail-closed DifferentialTestResult',
+    withIntegrationFlag(async () => {
+      const driver = new TestableDockerDriver((_cmd, args) => {
+        const proc = new FakeProcess(args);
+        setImmediate(() => {
+          proc.emitStdout('random garbage output\nno structure here\n');
+          proc.emitClose(0);
+        });
+        return proc;
+      });
+
+      const result = await driver.spawn(LIFECYCLE_INPUT as Parameters<typeof driver.spawn>[0]);
+
+      expect(result.outcome).toBe('success');
+      if (result.outcome === 'success') {
+        expect(result.differentialTest.upstreamSuitePassed).toBe(false);
+        expect(result.differentialTest.newTestsPassed).toBe(false);
+        expect(result.differentialTest.newCodeCoveragePct).toBe(0);
+      }
+    }),
+  );
+
+  it(
+    'TestableDockerDriver: upstream failure + head pass → both preserved correctly',
+    withIntegrationFlag(async () => {
+      const output = [
+        'Running upstream tests...',
+        'FAIL: 2 tests failed',
+        DIFFERENTIAL_RESULT_SENTINEL,
+        JSON.stringify({
+          upstreamPassed: false,
+          upstreamOutput: 'FAIL: test A and test B failed',
+          headPassed: true,
+          headOutput: 'All new tests passed',
+          coveragePct: 77.3,
+        }),
+      ].join('\n');
+
+      const driver = new TestableDockerDriver((_cmd, args) => {
+        const proc = new FakeProcess(args);
+        setImmediate(() => {
+          proc.emitStdout(output);
+          proc.emitClose(0);
+        });
+        return proc;
+      });
+
+      const result = await driver.spawn(LIFECYCLE_INPUT as Parameters<typeof driver.spawn>[0]);
+
+      expect(result.outcome).toBe('success');
+      if (result.outcome === 'success') {
+        expect(result.differentialTest.upstreamSuitePassed).toBe(false);
+        expect(result.differentialTest.newTestsPassed).toBe(true);
+        expect(result.differentialTest.newCodeCoveragePct).toBe(77.3);
+      }
+    }),
+  );
+});
+
+// ── AISDLC-509: buildDifferentialTestScript — in-container script shape ────────
+
+describe('buildDifferentialTestScript (AISDLC-509 AC-1)', () => {
+  it('returns a non-empty string', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    expect(typeof script).toBe('string');
+    expect(script.length).toBeGreaterThan(0);
+  });
+
+  it('contains the sentinel emission command', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    expect(script).toContain(DIFFERENTIAL_RESULT_SENTINEL);
+  });
+
+  it('contains the upstream ref passed in', () => {
+    const ref = 'https://github.com/example/myrepo.git';
+    const script = buildDifferentialTestScript(ref);
+    expect(script).toContain(ref);
+  });
+
+  it('contains git apply (diff applied as data, not executed)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    expect(script).toContain('git apply');
+  });
+
+  it('reads the diff from SANDBOX_PR_DIFF_B64 (base64 env var, not interpolated)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // The diff must come from an env var, not be interpolated directly into the script
+    expect(script).toContain('SANDBOX_PR_DIFF_B64');
+    expect(script).toContain('base64 -d');
+  });
+
+  it('contains upstreamPassed in the JSON emission', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    expect(script).toContain('upstreamPassed');
+    expect(script).toContain('headPassed');
+    expect(script).toContain('coveragePct');
+  });
+
+  it('does NOT contain perTestTimeout prefix when perTestTimeoutSeconds is not set', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // When no per-test timeout, 'timeout <N>' should not be present as a command prefix
+    // (it may appear in comments or variable names but not as a shell command)
+    expect(script).not.toMatch(/^timeout \d+/m);
+  });
+
+  it('wraps test command with timeout <N> when perTestTimeoutSeconds is set', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git', 60);
+    expect(script).toContain('timeout 60');
+  });
+
+  it('uses integer timeout (floors decimal seconds)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git', 30.7);
+    // Should floor to 30, not 30.7
+    expect(script).toContain('timeout 30');
+  });
+
+  it('ignores zero perTestTimeoutSeconds (not a valid timeout)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git', 0);
+    // Zero should NOT produce a timeout prefix
+    expect(script).not.toMatch(/timeout 0\b/);
+  });
+
+  it('contains set -e for fail-fast shell behavior', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    expect(script).toContain('set -e');
+  });
+
+  it('SANDBOX_PR_DIFF_B64 env var is referenced in the script (base64 injection guard)', () => {
+    // Verify the diff is not embedded in the script itself — it is passed as
+    // an environment variable and decoded inside the container. This prevents
+    // shell metacharacters in the diff from executing arbitrary commands.
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    expect(script).toContain('SANDBOX_PR_DIFF_B64');
+  });
+
+  it('script writes to /tmp/pr.diff (not executed, only applied via git apply)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    expect(script).toContain('pr.diff');
+    expect(script).toContain('git apply');
+  });
+
+  it('contains pnpm test as the primary test runner', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    expect(script).toContain('pnpm test');
+  });
+});
+
+// ── Fix-iteration: validateUpstreamMainRef — MINOR #4 (unescaped interpolation) ─
+
+describe('validateUpstreamMainRef (AISDLC-509 fix: unescaped interpolation guard)', () => {
+  it('accepts a full 40-char hex SHA', () => {
+    expect(() => validateUpstreamMainRef('a'.repeat(40))).not.toThrow();
+  });
+
+  it('accepts a short 7-char hex SHA', () => {
+    expect(() => validateUpstreamMainRef('abc1234')).not.toThrow();
+  });
+
+  it('accepts a 64-char hex SHA (upper bound)', () => {
+    expect(() => validateUpstreamMainRef('f'.repeat(64))).not.toThrow();
+  });
+
+  it('accepts https:// URL', () => {
+    expect(() => validateUpstreamMainRef('https://github.com/example/repo.git')).not.toThrow();
+  });
+
+  it('accepts git:// URL', () => {
+    expect(() => validateUpstreamMainRef('git://github.com/example/repo.git')).not.toThrow();
+  });
+
+  it('accepts ssh:// URL', () => {
+    expect(() => validateUpstreamMainRef('ssh://git@github.com/example/repo.git')).not.toThrow();
+  });
+
+  it('accepts git@ (SCP-style) URL', () => {
+    expect(() => validateUpstreamMainRef('git@github.com:example/repo.git')).not.toThrow();
+  });
+
+  it('rejects empty string', () => {
+    expect(() => validateUpstreamMainRef('')).toThrow();
+  });
+
+  it('rejects a local file path (injection risk)', () => {
+    expect(() => validateUpstreamMainRef('/tmp/evil-repo')).toThrow(/not a valid/i);
+  });
+
+  it('rejects a ref with shell metacharacters (injection attempt)', () => {
+    expect(() => validateUpstreamMainRef("'; rm -rf /; echo '")).toThrow(/not a valid/i);
+  });
+
+  it('rejects a ref with $() subshell syntax', () => {
+    expect(() => validateUpstreamMainRef('$(rm -rf /)')).toThrow(/not a valid/i);
+  });
+
+  it('rejects a 6-char hex string (too short for SHA)', () => {
+    // 6 hex chars is below the 7-char minimum
+    expect(() => validateUpstreamMainRef('abc123')).toThrow(/not a valid/i);
+  });
+
+  it('rejects a 65-char hex string (too long for SHA, no URL scheme)', () => {
+    expect(() => validateUpstreamMainRef('a'.repeat(65))).toThrow(/not a valid/i);
+  });
+
+  it('rejects mixed non-hex SHA-like string', () => {
+    // Contains 'g' which is not a hex character
+    expect(() => validateUpstreamMainRef('gabcdef1234567')).toThrow(/not a valid/i);
+  });
+
+  it('buildDifferentialTestScript throws for invalid ref (not a valid SHA/URL)', () => {
+    expect(() => buildDifferentialTestScript('/tmp/evil-path')).toThrow(/not a valid/i);
+  });
+
+  it('buildDifferentialTestScript does NOT throw for a valid SHA ref', () => {
+    expect(() => buildDifferentialTestScript('a'.repeat(40))).not.toThrow();
+  });
+
+  it('buildDifferentialTestScript does NOT throw for a valid https URL', () => {
+    expect(() => buildDifferentialTestScript('https://github.com/example/repo.git')).not.toThrow();
+  });
+});
+
+// ── Fix-iteration: script correctness — bugs 1-3 ─────────────────────────────
+
+describe('buildDifferentialTestScript — fix: coverage flag forwarded (bug #2)', () => {
+  it('head test command includes --coverage as a direct flag (not after --)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // The coverage flag must be passed as a pnpm/npm flag, not after `--`.
+    // The broken form was: `sh -c 'pnpm test ...' -- --coverage`
+    // The correct form: `sh -c 'pnpm test --coverage ...'`
+    expect(script).toContain('pnpm test --coverage');
+  });
+
+  it('head test command: --coverage appears within the sh -c quoted command', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // Must NOT use the `-- --coverage` form (passes --coverage as positional $1 to sh)
+    expect(script).not.toContain("'pnpm test 2>&1 || npm test 2>&1' -- --coverage");
+  });
+
+  it('with perTestTimeoutSeconds: head cmd has coverage inside the sh -c string', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git', 60);
+    expect(script).toContain('pnpm test --coverage');
+    // The timeout prefix must wrap the whole sh -c command, not be inside it
+    expect(script).toMatch(/timeout 60\s+sh\s+-c\s+'pnpm test --coverage/);
+  });
+});
+
+describe('buildDifferentialTestScript — fix: git apply fail-closed (bug #1)', () => {
+  it('git apply failure exits with sentinel + exit 1 (not silently continues)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // Must use `if ! git apply` pattern (fail-closed)
+    expect(script).toContain('if ! git apply');
+    // On failure: must emit sentinel and exit 1
+    expect(script).toContain('exit 1');
+    // Must NOT use the broken `|| { echo ...; }` pattern (which continues silently)
+    expect(script).not.toMatch(/git apply[^;]*\|\|\s*\{[\s\S]*?echo "git apply failed/);
+  });
+
+  it('on git apply failure: script emits the sentinel before exit 1 in the failure block', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // The apply-failure block assigns FAILURE_SENTINEL and emits it before exit 1.
+    // We verify the structure by checking that:
+    // (a) the failure-sentinel variable assignment is present
+    // (b) an `exit 1` follows the apply failure block
+    // (c) the apply-failure block emits coveragePct:0 (fail-closed invariant)
+    expect(script).toContain("FAILURE_SENTINEL='");
+    expect(script).toContain('exit 1');
+    // The apply-failure block is inside `if ! git apply ... fi`
+    const applyFailureIdx = script.indexOf('if ! git apply');
+    const headOutputIdx = script.indexOf('HEAD_OUTPUT=$(');
+    expect(applyFailureIdx).toBeGreaterThan(0);
+    expect(headOutputIdx).toBeGreaterThan(0);
+    // The git apply failure block ends with `exit 1` BEFORE HEAD_OUTPUT
+    // Find the exit 1 that comes AFTER the git apply block
+    const applyBlockEnd = script.indexOf('exit 1', applyFailureIdx);
+    expect(applyBlockEnd).toBeGreaterThan(applyFailureIdx);
+    expect(applyBlockEnd).toBeLessThan(headOutputIdx);
+  });
+
+  it(
+    'TestableDockerDriver: apply failure → sentinel emitted + non-zero exit → outcome:error',
+    withIntegrationFlag(async () => {
+      // Simulate the container running the fixed script: apply fails, script emits
+      // sentinel + failure JSON, then exits 1. The TypeScript layer should receive
+      // outcome:error (non-zero exit) with the failure sentinel in stdout.
+      const failureJson = JSON.stringify({
+        upstreamPassed: false,
+        upstreamOutput: '',
+        headPassed: false,
+        headOutput: 'git apply failed',
+        coveragePct: 0,
+      });
+      const stdout = `git apply failed — diff could not be applied cleanly\n${DIFFERENTIAL_RESULT_SENTINEL}\n${failureJson}\n`;
+
+      const driver = new TestableDockerDriver((_cmd, args) => {
+        const proc = new FakeProcess(args);
+        setImmediate(() => {
+          proc.emitStdout(stdout);
+          proc.emitClose(1); // exit 1 — the fixed script exits 1 on apply failure
+        });
+        return proc;
+      });
+
+      const result = await driver.spawn(LIFECYCLE_INPUT as Parameters<typeof driver.spawn>[0]);
+      // Non-zero exit → outcome:error (the TS layer rejects the Promise)
+      expect(result.outcome).toBe('error');
+      if (result.outcome === 'error') {
+        expect(result.error).toContain('exited with code');
+        expect(result.error).toContain('1');
+      }
+      // The container DID emit the sentinel — it's in the error message (stdout truncated there)
+      // This is the fail-closed guarantee: non-zero exit → never a false pass
+    }),
+  );
+});
+
+describe('buildDifferentialTestScript — fix: base-before-apply ordering (bug #3)', () => {
+  it('upstream test run appears BEFORE git apply in the script', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // Find positions of key lines in the script
+    const upstreamTestPos = script.indexOf('UPSTREAM_OUTPUT=$(');
+    const gitApplyPos = script.indexOf('if ! git apply');
+    expect(upstreamTestPos).toBeGreaterThan(0);
+    expect(gitApplyPos).toBeGreaterThan(0);
+    // Upstream tests must run BEFORE the diff is applied
+    expect(upstreamTestPos).toBeLessThan(gitApplyPos);
+  });
+
+  it('head test run appears AFTER git apply in the script', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    const gitApplyPos = script.indexOf('if ! git apply');
+    const headTestPos = script.indexOf('HEAD_OUTPUT=$(');
+    expect(gitApplyPos).toBeGreaterThan(0);
+    expect(headTestPos).toBeGreaterThan(0);
+    // Head tests must run AFTER the diff is applied
+    expect(headTestPos).toBeGreaterThan(gitApplyPos);
+  });
+
+  it('script has two separate test invocations (base run + head run)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // Both UPSTREAM_OUTPUT and HEAD_OUTPUT capture blocks are present
+    expect(script).toContain('UPSTREAM_OUTPUT=$(');
+    expect(script).toContain('HEAD_OUTPUT=$(');
+    // They must be distinct (not the same variable assignment)
+    const upstreamCount = (script.match(/UPSTREAM_OUTPUT=\$\(/g) ?? []).length;
+    const headCount = (script.match(/HEAD_OUTPUT=\$\(/g) ?? []).length;
+    expect(upstreamCount).toBe(1);
+    expect(headCount).toBe(1);
+  });
+
+  it('base test command does NOT include --coverage (only head suite gets coverage)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // The upstream section runs WITHOUT --coverage
+    const upstreamSection = script.substring(
+      script.indexOf('UPSTREAM_OUTPUT=$('),
+      script.indexOf('if ! git apply'),
+    );
+    expect(upstreamSection).not.toContain('--coverage');
+  });
+});
+
+// ── Fix-iteration: coverage regex — MINOR #5 (integer % support) ─────────────
+
+describe('buildDifferentialTestScript — fix: integer % parsing (bug #5)', () => {
+  it('script uses regex that accepts integer percent (no decimal required)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // The fixed regex is [0-9]+([.][0-9]+)?% — the decimal part is optional
+    // Verify the broken regex [0-9]+\.[0-9]+% is NOT present
+    expect(script).not.toMatch(/\[0-9\]\+\\\.\[0-9\]/);
+    // And the fixed form (optional decimal) IS present
+    expect(script).toMatch(/\[0-9\]\+.*\[0-9\]/);
+  });
+
+  it('parseDifferentialTestOutput: integer % coverage (e.g. 82%) is parsed correctly', () => {
+    // This tests the TypeScript parser, but the shell produces the coveragePct number,
+    // so the shell's regex must accept integers. We test by injecting an integer
+    // coveragePct value directly into the parser:
+    const result = parseDifferentialTestOutput(
+      `${DIFFERENTIAL_RESULT_SENTINEL}\n` +
+        JSON.stringify({
+          upstreamPassed: true,
+          upstreamOutput: '',
+          headPassed: true,
+          headOutput: 'Lines: 82%',
+          coveragePct: 82, // integer — must be accepted
+        }),
+    );
+    expect(result.newCodeCoveragePct).toBe(82);
+    expect(result.newTestsPassed).toBe(true);
+  });
+});
+
+// ── Fix-iteration #2 MAJOR: empty-diff fail-closed (AISDLC-509) ──────────────
+//
+// When prDiff is an empty string, runDockerDifferentialTest must throw
+// (producing outcome:'error') rather than silently skipping git apply and
+// returning a false headPassed:true.
+
+describe('Fix #2 MAJOR — empty-diff fail-closed in runDockerDifferentialTest', () => {
+  it(
+    'DockerSandboxDriver.spawn rejects empty prDiff with outcome:error (not false headPassed:true)',
+    withIntegrationFlag(async () => {
+      // Create a driver where spawn would otherwise succeed if it got to docker run
+      const driver = new TestableDockerDriver((_cmd, args) => {
+        const proc = new FakeProcess(args);
+        setImmediate(() => proc.emitClose(0));
+        return proc;
+      });
+
+      const result = await driver.spawn({
+        ...LIFECYCLE_INPUT,
+        prDiff: '', // empty diff — must fail-closed
+      } as Parameters<typeof driver.spawn>[0]);
+
+      // Must NOT produce outcome:'success' with headPassed:true (the false-pass scenario)
+      expect(result.outcome).toBe('error');
+      if (result.outcome === 'error') {
+        expect(result.error).toMatch(/empty/i);
+        // Must name the root cause
+        expect(result.error).toMatch(/prDiff|diff/i);
+      }
+      // No docker process should have been spawned (rejected before cidfile creation)
+      expect(driver.spawnCount).toBe(0);
+    }),
+  );
+
+  it(
+    'runSandbox rejects empty prDiff with outcome:error via DockerSandboxDriver',
+    withIntegrationFlag(async () => {
+      // Use TestableDockerDriver so no real docker daemon is needed
+      const driver = new TestableDockerDriver((_cmd, args) => {
+        const proc = new FakeProcess(args);
+        setImmediate(() => proc.emitClose(0));
+        return proc;
+      });
+
+      const result = await runSandbox({
+        prNumber: 1,
+        prDiff: '', // empty diff
+        upstreamMainRef: 'https://github.com/example/repo.git',
+        config: DEFAULT_SANDBOX_CONFIG,
+        driverOverride: driver,
+      });
+
+      expect(result.outcome).toBe('error');
+      if (result.outcome === 'error') {
+        expect(result.error).toMatch(/empty|prDiff|diff/i);
+      }
+    }),
+  );
+
+  it('buildDifferentialTestScript: empty SANDBOX_PR_DIFF_B64 → sentinel + exit 1 (not silent skip)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+
+    // The OLD (broken) guard: `if [ -n "${SANDBOX_PR_DIFF_B64:-}" ]` — silently skips apply
+    // The NEW (fixed) guard: `if [ -z "${SANDBOX_PR_DIFF_B64:-}" ]` — emits sentinel + exit 1
+    expect(script).toContain('[ -z "${SANDBOX_PR_DIFF_B64:-}" ]');
+    // Must NOT contain the old guard that silently skips apply on empty var
+    expect(script).not.toContain('[ -n "${SANDBOX_PR_DIFF_B64:-}" ]');
+
+    // When the guard fires (var is empty), the script must emit the failure sentinel
+    // and exit 1 — NOT continue to run tests against the unpatched base
+    const guardIdx = script.indexOf('[ -z "${SANDBOX_PR_DIFF_B64:-}" ]');
+    const sentinelAfterGuard = script.indexOf(DIFFERENTIAL_RESULT_SENTINEL, guardIdx);
+    const exitAfterGuard = script.indexOf('exit 1', guardIdx);
+    expect(sentinelAfterGuard).toBeGreaterThan(guardIdx);
+    expect(exitAfterGuard).toBeGreaterThan(guardIdx);
+    // The sentinel comes before exit 1
+    expect(sentinelAfterGuard).toBeLessThan(exitAfterGuard);
+  });
+
+  it('buildDifferentialTestScript: git apply now runs unconditionally (after guard), not inside if-block', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // After the guard emits sentinel+exit1 on empty var, the apply runs unconditionally.
+    // Verify: `printf '%s' "$SANDBOX_PR_DIFF_B64" | base64 -d` is present as a top-level
+    // statement (not nested in an `if [ -n ... ]` block that would silently skip it).
+    expect(script).toContain('printf \'%s\' "$SANDBOX_PR_DIFF_B64" | base64 -d');
+    // Confirm the old `if [ -n "${SANDBOX_PR_DIFF_B64:-}" ]` guard is gone
+    expect(script).not.toContain('if [ -n "${SANDBOX_PR_DIFF_B64:-}" ]');
+  });
+
+  it(
+    'TestableDockerDriver: empty-diff → outcome:error, teardown still called',
+    withIntegrationFlag(async () => {
+      // The error happens before docker run is invoked — teardown should still be no-op safe
+      const driver = new TestableDockerDriver((_cmd, args) => {
+        const proc = new FakeProcess(args);
+        setImmediate(() => proc.emitClose(0));
+        return proc;
+      });
+
+      const result = await driver.spawn({
+        ...LIFECYCLE_INPUT,
+        prDiff: '',
+      } as Parameters<typeof driver.spawn>[0]);
+
+      expect(result.outcome).toBe('error');
+      // teardown is idempotent even when no docker process was spawned
+      await expect(driver.teardown()).resolves.toBeUndefined();
+    }),
+  );
+});
+
+// ── Fix-iteration #2 MINOR #2: JSDoc ordering ────────────────────────────────
+// Regression guard: the JSDoc for buildDifferentialTestScript must immediately
+// precede that function (not validateUpstreamMainRef). This is structural only
+// — the test verifies the exported function signatures haven't broken.
+
+describe('Fix #2 MINOR #2 — JSDoc reorder does not break exports', () => {
+  it('validateUpstreamMainRef is still exported and callable', () => {
+    // Basic smoke-test: the reorder must not have moved validateUpstreamMainRef
+    // to a position after buildDifferentialTestScript makes the export unreachable
+    expect(typeof validateUpstreamMainRef).toBe('function');
+    expect(() => validateUpstreamMainRef('abc1234')).not.toThrow(); // valid SHA
+    expect(() => validateUpstreamMainRef('')).toThrow(); // invalid
+  });
+
+  it('buildDifferentialTestScript is still exported and callable', () => {
+    expect(typeof buildDifferentialTestScript).toBe('function');
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    expect(typeof script).toBe('string');
+    expect(script.length).toBeGreaterThan(0);
+  });
+
+  it('validateUpstreamMainRef still rejects injection attempts after reorder', () => {
+    expect(() => validateUpstreamMainRef("'; rm -rf /; echo '")).toThrow(/not a valid/i);
+    expect(() => validateUpstreamMainRef('$(rm -rf /)')).toThrow(/not a valid/i);
+    expect(() => validateUpstreamMainRef('/tmp/evil')).toThrow(/not a valid/i);
+  });
+});
+
+// ── Fix-iteration #2 MINOR #3: baseSha checkout for URL-clone path ───────────
+
+describe('Fix #2 MINOR #3 — baseSha param in buildDifferentialTestScript', () => {
+  it('without baseSha: URL-clone script does NOT attempt checkout (comment only)', () => {
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git');
+    // No baseSha → no git checkout command in the URL branch
+    // The script should contain a comment about the invariant risk instead
+    expect(script).toContain('baseSha not provided');
+    expect(script).not.toContain("git checkout '");
+  });
+
+  it('with valid baseSha: URL-clone script includes git checkout <baseSha>', () => {
+    const sha = 'a'.repeat(40); // valid 40-char SHA
+    const script = buildDifferentialTestScript(
+      'https://github.com/example/repo.git',
+      undefined,
+      sha,
+    );
+    // The URL branch must contain `git checkout '<sha>'`
+    expect(script).toContain(`git checkout '${sha}'`);
+    // Must also have a fallback exit 1 for checkout failure
+    const checkoutIdx = script.indexOf(`git checkout '${sha}'`);
+    const failAfterCheckout = script.indexOf('exit 1', checkoutIdx);
+    expect(failAfterCheckout).toBeGreaterThan(checkoutIdx);
+  });
+
+  it('with baseSha: SHA-form ref path is unaffected (baseSha redundant but harmless)', () => {
+    // When upstreamMainRef is a SHA, the else branch handles it (cd repo + git checkout REF).
+    // baseSha does not appear in the SHA branch.
+    const sha = 'a'.repeat(40);
+    const script = buildDifferentialTestScript(sha, undefined, sha);
+    // The SHA branch still has: git checkout "$UPSTREAM_REF"
+    expect(script).toContain('git checkout "$UPSTREAM_REF"');
+    // The URL branch content (git clone) is NOT present (ref is SHA, not URL)
+    // — actually both branches are in the script, so we check the ordering
+    const urlBranchIdx = script.indexOf('git clone');
+    const shaBranchIdx = script.indexOf('git checkout "$UPSTREAM_REF"');
+    // SHA branch checkout appears in the else block (after the URL if-block)
+    expect(shaBranchIdx).toBeGreaterThan(urlBranchIdx);
+  });
+
+  it('baseSha is validated as a hex SHA — non-hex string produces comment-only output', () => {
+    // If the caller passes an invalid baseSha (not a hex SHA), the script falls
+    // back to the comment-only form (no checkout command). This prevents injection
+    // via a crafted baseSha that evades the regex check.
+    const invalidBaseSha = "'; rm -rf /; echo '";
+    const script = buildDifferentialTestScript(
+      'https://github.com/example/repo.git',
+      undefined,
+      invalidBaseSha,
+    );
+    // The invalid baseSha must NOT produce a git checkout line
+    expect(script).not.toContain(`git checkout '${invalidBaseSha}'`);
+    // It falls back to the comment form
+    expect(script).toContain('baseSha not provided');
+  });
+
+  it('with baseSha: perTestTimeoutSeconds still works correctly alongside baseSha', () => {
+    const sha = 'deadbeef1234567890abcdef1234567890abcdef12';
+    const script = buildDifferentialTestScript('https://github.com/example/repo.git', 45, sha);
+    expect(script).toContain('timeout 45');
+    expect(script).toContain(`git checkout '${sha}'`);
+  });
+
+  it(
+    'TestableDockerDriver with baseSha: URL-form spawn includes checkout in script',
+    withIntegrationFlag(async () => {
+      const sha = 'cafebabe1234567890abcdef1234567890abcdef12';
+      // We can't call buildDifferentialTestScript with baseSha directly from spawn
+      // (spawn calls it internally without baseSha). This test verifies the API exists
+      // and the script content is correct.
+      const script = buildDifferentialTestScript(
+        'https://github.com/example/repo.git',
+        undefined,
+        sha,
+      );
+      expect(script).toContain(`git checkout '${sha}'`);
+      // baseSha checkout appears in the URL branch (before the else)
+      const urlBranchStart = script.indexOf('git clone');
+      const checkoutIdx = script.indexOf(`git checkout '${sha}'`);
+      const elseBranchIdx = script.indexOf('else\n');
+      expect(checkoutIdx).toBeGreaterThan(urlBranchStart);
+      expect(checkoutIdx).toBeLessThan(elseBranchIdx);
+    }),
+  );
+});
+
+// ── AISDLC-509: SANDBOX_PR_DIFF_B64 env var injection via TestableDockerDriver ─
+
+describe('SANDBOX_PR_DIFF_B64 env var injection (AISDLC-509 AC-1)', () => {
+  it(
+    'SANDBOX_PR_DIFF_B64 is passed to docker run env containing base64-encoded diff',
+    withIntegrationFlag(async () => {
+      // We test the env injection through the spawn seam by hooking _spawnProcess options.
+      // Instead of TestableDockerDriver (which ignores options), create a subclass that
+      // captures the env.
+      class EnvCapturingDriver extends DockerSandboxDriver {
+        public capturedEnv: Record<string, string> | undefined;
+
+        protected _spawnProcess(
+          _cmd: string,
+          args: string[],
+          options: import('node:child_process').SpawnOptions,
+        ): import('node:child_process').ChildProcess {
+          this.capturedEnv = options.env as Record<string, string> | undefined;
+          const proc = new FakeProcess(
+            args,
+          ) as unknown as import('node:child_process').ChildProcess;
+          setImmediate(() => (proc as unknown as FakeProcess).emitClose(0));
+          return proc;
+        }
+      }
+
+      const envDriver = new EnvCapturingDriver();
+      const prDiff = 'diff --git a/foo.ts b/foo.ts\n+// new line';
+
+      await envDriver.spawn({
+        ...LIFECYCLE_INPUT,
+        prDiff,
+      });
+
+      // SANDBOX_PR_DIFF_B64 must be present in the spawned process env
+      expect(envDriver.capturedEnv).toBeDefined();
+      expect(envDriver.capturedEnv?.['SANDBOX_PR_DIFF_B64']).toBeDefined();
+
+      // Verify the base64 decodes back to the original diff
+      const decoded = Buffer.from(
+        envDriver.capturedEnv!['SANDBOX_PR_DIFF_B64']!,
+        'base64',
+      ).toString('utf8');
+      expect(decoded).toBe(prDiff);
+
+      // Withheld credentials must NOT appear in the env
+      expect(envDriver.capturedEnv?.['GITHUB_TOKEN']).toBeUndefined();
+      expect(envDriver.capturedEnv?.['NPM_TOKEN']).toBeUndefined();
+      expect(envDriver.capturedEnv?.['AI_SDLC_SIGNING_KEY']).toBeUndefined();
     }),
   );
 });
