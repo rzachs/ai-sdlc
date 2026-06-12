@@ -77,6 +77,7 @@ import {
   type SubagentSpawner,
 } from '../types.js';
 import { writeEvent, type OrchestratorEvent } from './events.js';
+import { computeDurationMs } from './profiling.js';
 import { isOrchestratorEnabled, orchestratorDisabledMessage } from './feature-flag.js';
 import {
   applyHcCost,
@@ -570,6 +571,18 @@ export async function runOrchestratorTick(
           branch: entry.branch,
           mergedAt: entry.mergedAt,
         });
+        // AISDLC-493 — emit DispatchToMergeCompleted when we have enough
+        // data to compute the full lifecycle (dispatchedAt + totalLifecycleMs).
+        if (entry.taskId && entry.dispatchedAt && entry.totalLifecycleMs !== undefined) {
+          emit({
+            type: 'DispatchToMergeCompleted',
+            taskId: entry.taskId,
+            dispatchedAt: entry.dispatchedAt,
+            mergedAt: entry.mergedAt,
+            totalLifecycleMs: entry.totalLifecycleMs,
+            ciWaitMs: entry.ciWaitMs ?? null,
+          });
+        }
       }
     } catch (err) {
       logger.warn(`[orchestrator] sweep failed: ${err}; continuing tick`);
@@ -1086,6 +1099,11 @@ export async function runOrchestratorTick(
       emit({ type: 'OrchestratorDispatched', taskId });
       try {
         const richResult = await richDispatchFn(taskId);
+        // AISDLC-493 minor-3 fix: capture completedAt inside the async closure
+        // so parallel tasks each get their own wall-clock timestamp rather than
+        // sharing the post-allSettled serial-loop clock (which would make every
+        // task in a batch report the slowest sibling's duration).
+        const completedAt = now().toISOString();
         // Normalise: the rich result carries the PipelineResult + optional
         // pipeline/failure extras. Pass all three so the settled-value
         // aggregator can populate the full TaskDispatchOutcome.
@@ -1095,10 +1113,13 @@ export async function runOrchestratorTick(
           pipeline: richResult.pipeline,
           failure: richResult.failure,
           preDispatchStatus,
+          startedAt,
+          completedAt,
         };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        return { taskId, error: message, preDispatchStatus };
+        const completedAt = now().toISOString();
+        return { taskId, error: message, preDispatchStatus, startedAt, completedAt };
       } finally {
         // Only release the slot if THIS call won the claim — otherwise we'd
         // free a slot owned by a concurrent claimer (defensive; today's
@@ -1347,12 +1368,24 @@ export async function runOrchestratorTick(
       };
     }
     outcomes.push(outcomeEntry);
-    emit({
+    // AISDLC-493: fix AISDLC-479 dead wiring — compute and include durationMs so
+    // the profiling aggregator and calibration writer receive actual wall-clock data.
+    // AISDLC-493 minor-3: use value.completedAt (captured per-task inside the
+    // async closure) rather than now() which accumulates sibling wait time in
+    // parallel batches.
+    const completedEventPayload: Omit<OrchestratorEvent, 'ts'> & { ts?: string } = {
       type: 'OrchestratorCompleted',
       taskId: result.taskId,
       outcome: result.outcome,
       prUrl: result.prUrl,
-    });
+    };
+    if (value.startedAt && value.completedAt) {
+      const durationMs = computeDurationMs(value.startedAt, value.completedAt);
+      if (durationMs !== undefined) {
+        completedEventPayload.durationMs = durationMs;
+      }
+    }
+    emit(completedEventPayload);
     // AISDLC-177 — failure outcomes from `executePipeline()` (the
     // witness case: `developer-failed` from a dev subagent that returned
     // commitSha:null, plus the AISDLC-176 `developer-json-contract-violated`)
@@ -1447,11 +1480,22 @@ type DispatchSettledValue =
   | {
       taskId: string;
       preDispatchStatus: string;
+      startedAt: string;
+      /** AISDLC-493 minor-3: per-task completion time captured inside the async closure. */
+      completedAt: string;
       result: PipelineResult;
       pipeline?: PipelineOutcomeDetail;
       failure?: PipelineFailureDetail;
     }
-  | { taskId: string; preDispatchStatus: string; error: string; result?: undefined };
+  | {
+      taskId: string;
+      preDispatchStatus: string;
+      startedAt: string;
+      /** AISDLC-493 minor-3: per-task completion time captured inside the async closure. */
+      completedAt: string;
+      error: string;
+      result?: undefined;
+    };
 
 interface MaybeRollbackArgs {
   taskId: string;
