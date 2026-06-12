@@ -66,8 +66,14 @@ export interface WebhookManager {
 export function createWebhookManager(config: WebhookManagerConfig): WebhookManager {
   const server = createWebhookServer({ port: config.port, host: config.host });
 
-  // Create unified bridges
-  const issueBridge = createWebhookBridge<IssueEvent>((payload) => {
+  // Create unified bridges.
+  // The `: unknown` annotations below are explicit (matching the
+  // `WebhookTransformer<T> = (payload: unknown) => T | null` contract) to guard
+  // against a fresh-worktree implicit-any (TS7006): when `@ai-sdlc/reference`
+  // dist is absent, TS resolves its types as `any` and the inferred callback
+  // param becomes implicitly `any`. Do not remove these as "redundant" — that
+  // re-introduces the build-order-sensitive typecheck failure (AISDLC-517).
+  const issueBridge = createWebhookBridge<IssueEvent>((payload: unknown) => {
     // Try each transformer in order
     return (
       transformIssueEvent(payload) ??
@@ -77,11 +83,11 @@ export function createWebhookManager(config: WebhookManagerConfig): WebhookManag
     );
   });
 
-  const prBridge = createWebhookBridge<PREvent>((payload) => {
+  const prBridge = createWebhookBridge<PREvent>((payload: unknown) => {
     return transformPREvent(payload) ?? transformGitLabMREvent(payload);
   });
 
-  const buildBridge = createWebhookBridge<BuildEvent>((payload) => {
+  const buildBridge = createWebhookBridge<BuildEvent>((payload: unknown) => {
     return transformBuildEvent(payload) ?? transformGitLabPipelineEvent(payload);
   });
 
