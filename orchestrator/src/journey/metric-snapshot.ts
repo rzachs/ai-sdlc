@@ -46,6 +46,21 @@
  * the soul-default, the strictest constraint wins. This mirrors the
  * RFC-0030 OQ-13.3 UNION precedent for multi-posture composition.
  *
+ * ### Decision-routing must-consume contract
+ *
+ * `getLatestMetricSnapshot` emits `decision: 'journey-metric-stale'` when a
+ * snapshot is present but older than `thresholdDays`. Callers MUST inspect
+ * `result.decision` and route it — typically to the RFC-0035 G0 batch-review
+ * queue — before using `result.snapshot.spec.value` for Cκ scoring. Silently
+ * dropping `result.decision` defeats the operator-visibility guarantee that
+ * makes warn-and-unknown safe (non-fail-closed). A typed must-consume pattern:
+ *
+ *   ```ts
+ *   const result = getLatestMetricSnapshot(journey, metricId, opts);
+ *   if (result.decision) emitDecision(result.decision); // required
+ *   if (result.freshness === 'fresh') useValue(result.snapshot!.spec.value);
+ *   ```
+ *
  * @see spec/rfcs/RFC-0018-in-soul-journey-pattern.md §10.1 OQ-5 + OQ-6
  * @see spec/schemas/metric-snapshot.v1.schema.json
  */
@@ -228,7 +243,12 @@ export function getLatestMetricSnapshot(
   });
 
   const recordedAtMs = new Date(latest.spec.recordedAt).getTime();
-  const ageInDays = (nowMs - recordedAtMs) / (1000 * 60 * 60 * 24);
+  // Guard: a future-dated recordedAt (recordedAt > now) would yield a negative
+  // ageInDays, making the metric appear perpetually fresh and suppressing the
+  // journey-metric-stale Decision. Clamp negative ages to stale so a
+  // misconfigured analytics pipeline cannot silently defeat staleness checks.
+  const rawAgeInDays = (nowMs - recordedAtMs) / (1000 * 60 * 60 * 24);
+  const ageInDays = rawAgeInDays < 0 ? thresholdDays + 1 : rawAgeInDays;
 
   if (ageInDays > thresholdDays) {
     return {
@@ -335,7 +355,8 @@ export interface AuditOverdueResult {
   readonly erho5Multiplier: number;
   /**
    * Decision to emit for this result.
-   * `null` when daysOverdue <= 0 (audit is not yet overdue).
+   * `null` only when daysOverdue < 0 (audit not yet due). At daysOverdue >= 0
+   * (cadence+0d — no grace) a Decision is emitted per the policy.
    */
   readonly decision: AuditOverdueDecision | null;
 }
@@ -382,17 +403,22 @@ export interface ComputeAuditOverdueOptions {
  *   - daysOverdue ≥ 30  → `effective-block` (multiplier 0.0)
  *
  * Policy `hard-block` (HIPAA/PCI-DSS ultra-strict):
- *   - daysOverdue ≤ 0   → no impact (multiplier 1.0, no Decision)
- *   - daysOverdue > 0   → `effective-block` (multiplier 0.0)
+ *   - daysOverdue < 0   → no impact (multiplier 1.0, no Decision; not yet due)
+ *   - daysOverdue ≥ 0   → `effective-block` (multiplier 0.0) — cadence+0d, no grace
  *
- * When `daysOverdue <= 0`, returns multiplier 1.0 and `decision: null`
- * regardless of policy (audit is on-time or not yet due).
+ * When `daysOverdue < 0`, returns multiplier 1.0 and `decision: null`
+ * regardless of policy (audit is not yet due). At daysOverdue ≥ 0 each policy
+ * emits its Decision (no implicit grace day).
  */
 export function computeAuditOverdueErho5(options: ComputeAuditOverdueOptions): AuditOverdueResult {
   const { soulId, journeyId, daysOverdue, policy = 'graduated', graduatedThresholds } = options;
 
-  // Not yet overdue — no impact regardless of policy.
-  if (daysOverdue <= 0) {
+  // Strictly negative daysOverdue means the audit is not yet due — no impact
+  // regardless of policy. Note: daysOverdue === 0 means "exactly at cadence
+  // boundary (cadence+0d)" and is intentionally NOT caught here so the
+  // policy-specific logic below can apply. In particular, `hard-block`
+  // specifies "no grace at cadence+0d", meaning it must fire at daysOverdue=0.
+  if (daysOverdue < 0) {
     return {
       soulId,
       journeyId,
@@ -442,6 +468,23 @@ export function computeAuditOverdueErho5(options: ComputeAuditOverdueOptions): A
   }
 
   // policy === 'graduated' (default)
+  // Guard: NaN daysOverdue (e.g. from a division by zero or bad caller) must
+  // not fall through to the warn/1.0 return at the bottom of the graduated
+  // path, producing a fail-open result. Treat non-finite values as
+  // effective-block (conservative) so the pipeline aborts rather than silently
+  // continuing with an unknown overdue duration.
+  if (!Number.isFinite(daysOverdue)) {
+    return {
+      soulId,
+      journeyId,
+      daysOverdue,
+      policy,
+      impact: 'effective-block',
+      erho5Multiplier: ERHO5_MULTIPLIERS['effective-block'],
+      decision: 'journey-audit-overdue-blocking',
+    };
+  }
+
   const thresholds = {
     warnAt: graduatedThresholds?.warnAt ?? DEFAULT_GRADUATED_THRESHOLDS.warnAt,
     reduced25At: graduatedThresholds?.reduced25At ?? DEFAULT_GRADUATED_THRESHOLDS.reduced25At,
